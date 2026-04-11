@@ -1,0 +1,9 @@
+{
+  "name": "omeka/omeka-s",
+  "require": {
+    "php": "^8.1",
+    "laminas/laminas-mvc": "^3.3",
+    "omeka/omeka-s": "^4.0",
+    "doctrine/orm": "^2.15"
+  }
+}
