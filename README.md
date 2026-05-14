@@ -13,7 +13,7 @@ This module is intentionally heuristic and incremental.
 ## Install
 
 ```bash
-pip install git+https://gitlab.com/matthewd.xyzAI/attackmap-analyzers/attackmap-analyzer-omeka-s.git
+pip install git+https://github.com/mlaify/attackmap-analyzer-omeka-s.git
 ```
 
 ## Usage with AttackMap
