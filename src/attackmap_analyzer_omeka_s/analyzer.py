@@ -178,7 +178,8 @@ class OmekaSAnalyzer:
             self._append_unique_auth(result, "omeka_extension:factory", relative)
         if "'navigation'" in lowered or '"navigation"' in lowered:
             self._append_unique_auth(result, "omeka_extension:navigation", relative)
-        if "/module/" in f"/{relative.replace('\\\\', '/')}/":
+        normalized = relative.replace("\\", "/")
+        if "/module/" in f"/{normalized}/":
             self._append_unique_auth(result, "omeka_extension:module", relative)
 
     def _extract_external_calls(self, content: str, relative: str, result: ScanResult) -> None:
