@@ -1,5 +1,10 @@
 # AttackMap Omeka S Analyzer
 
+> [!NOTE]
+> **Development is paused.** This project is not under active development.
+> The code remains available for reference, and security reports are still
+> welcome at [security@mlaify.io](mailto:security@mlaify.io).
+
 `attackmap-analyzer-omeka-s` is an application-aware analyzer module for AttackMap.
 
 It focuses on Omeka S and emits structured scan signals for:
