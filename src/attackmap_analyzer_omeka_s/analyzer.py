@@ -8,11 +8,15 @@ from .contracts import AnalyzerMetadata, AuthHint, DatabaseHint, ExternalCall, R
 
 ROUTE_PATH_PATTERN = re.compile(r"['\"]route['\"]\s*=>\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
 ROUTE_NAME_PATTERN = re.compile(r"['\"]([A-Za-z0-9_\\-]+)['\"]\s*=>\s*\[\s*['\"]type['\"]\s*=>", re.IGNORECASE)
-CONTROLLER_PATTERN = re.compile(r"([A-Za-z_\\][A-Za-z0-9_\\]*Controller[A-Za-z0-9_\\]*)::class", re.IGNORECASE)
-SERVICE_PATTERN = re.compile(
-    r"([A-Za-z_\\][A-Za-z0-9_\\]*(?:Service|Manager|Repository|Adapter|Connection)[A-Za-z0-9_\\]*)::class",
-    re.IGNORECASE,
-)
+# `Foo\\BarController::class` — whole token matched possessively, keyword
+# checked in Python (see the service pattern below; mlaify/AttackMap#236).
+CONTROLLER_PATTERN = re.compile(r"(?<![A-Za-z0-9_\\])([A-Za-z_\\][A-Za-z0-9_\\]*+)::class")
+# Match the whole `Foo\\BarService::class` token in one possessive pass, then
+# check for a service keyword in Python. The old single regex
+# (`[..]*(?:Service|…)[..]*::class`) backtracked quadratically on a long
+# identifier-like line, enough to stall a scan (mlaify/AttackMap#236).
+SERVICE_PATTERN = re.compile(r"(?<![A-Za-z0-9_\\])([A-Za-z_\\][A-Za-z0-9_\\]*+)::class")
+_SERVICE_WORD = re.compile(r"Service|Manager|Repository|Adapter|Connection", re.IGNORECASE)
 OMEKA_SERVICE_PATTERN = re.compile(r"Omeka\\([A-Za-z_\\\\][A-Za-z0-9_\\\\]*)", re.IGNORECASE)
 OUTBOUND_PATTERNS = [
     re.compile(r"curl_init\s*\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
@@ -153,6 +157,8 @@ class OmekaSAnalyzer:
     def _extract_controllers_and_services(self, content: str, relative: str, result: ScanResult) -> None:
         found_controller = False
         for match in CONTROLLER_PATTERN.finditer(content):
+            if "controller" not in match.group(1).lower():
+                continue
             found_controller = True
             self._append_unique_auth(result, f"controller:{match.group(1)}", relative)
         if found_controller:
@@ -160,6 +166,8 @@ class OmekaSAnalyzer:
 
         for match in SERVICE_PATTERN.finditer(content):
             service_name = match.group(1)
+            if not _SERVICE_WORD.search(service_name):
+                continue
             self._append_unique_auth(result, f"service:{service_name}", relative)
             if "Connection" in service_name:
                 self._append_unique_database(result, "sql", relative)
