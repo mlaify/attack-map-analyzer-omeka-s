@@ -4,6 +4,8 @@ import json
 import re
 from pathlib import Path
 
+from attackmap.sdk import iter_repo_files, read_source, rel
+
 from .contracts import AnalyzerMetadata, AuthHint, DatabaseHint, ExternalCall, Route, ScanResult, SecretHint
 
 ROUTE_PATH_PATTERN = re.compile(r"['\"]route['\"]\s*=>\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
@@ -38,7 +40,7 @@ class OmekaSAnalyzer:
         scope="Omeka S and Omeka-style Laminas MVC projects with module config-driven routes and services.",
         targets=["omeka-s", "php-laminas", "php-web"],
         languages=["php"],
-        priority=20,
+        priority=160,
         experimental=True,
         enabled_by_default=False,
     )
@@ -52,17 +54,18 @@ class OmekaSAnalyzer:
         if not root.exists() or not root.is_dir():
             return False
 
-        if self._has_omeka_composer_signals(root / "composer.json"):
+        if self._has_omeka_composer_signals(root):
             return True
 
-        if (root / "config" / "application.config.php").exists() and any(root.rglob("module.config.php")):
-            if (root / "module").is_dir():
-                return True
+        if (
+            (root / "config" / "application.config.php").exists()
+            and (root / "module").is_dir()
+            and next(iter_repo_files(root, names={"module.config.php"}), None) is not None
+        ):
+            return True
 
-        for file_path in root.rglob("*.php"):
-            if any(part in {"vendor", ".git", "node_modules"} for part in file_path.parts):
-                continue
-            content = self._read_text(file_path)
+        for file_path in iter_repo_files(root, suffixes={".php"}):
+            content = read_source(file_path)
             if content and ("namespace Omeka" in content or "Omeka\\Connection" in content):
                 return True
         return False
@@ -73,25 +76,20 @@ class OmekaSAnalyzer:
         if not root.exists() or not root.is_dir():
             return result
 
-        composer_path = root / "composer.json"
-        if composer_path.exists():
-            self._extract_composer_signals(composer_path, result)
+        self._extract_composer_signals(root, result)
 
-        for file_path in root.rglob("*.php"):
-            if not file_path.is_file():
-                continue
-            if any(part in {"vendor", ".git", "node_modules"} for part in file_path.parts):
-                continue
-
+        # Pruned by repo-relative dir name (vendor, node_modules, .git, ...);
+        # symlinks out of the repo are not followed (AttackMap#253).
+        for file_path in iter_repo_files(root, suffixes={".php"}):
             result.files_scanned += 1
             if "php" not in result.languages:
                 result.languages.append("php")
 
-            content = self._read_text(file_path)
+            content = read_source(file_path)
             if content is None:
                 continue
 
-            relative = str(file_path.relative_to(root))
+            relative = rel(file_path, root)
             self._extract_routes_and_surfaces(content, relative, result)
             self._extract_controllers_and_services(content, relative, result)
             self._extract_extension_points(content, relative, result)
@@ -102,12 +100,9 @@ class OmekaSAnalyzer:
         result.languages.sort()
         return result
 
-    def _has_omeka_composer_signals(self, composer_path: Path) -> bool:
-        if not composer_path.exists():
-            return False
-        try:
-            data = json.loads(composer_path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+    def _has_omeka_composer_signals(self, root: Path) -> bool:
+        data = self._load_composer(root)
+        if data is None:
             return False
 
         requirements = {
@@ -120,10 +115,9 @@ class OmekaSAnalyzer:
                 return True
         return False
 
-    def _extract_composer_signals(self, composer_path: Path, result: ScanResult) -> None:
-        try:
-            data = json.loads(composer_path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+    def _extract_composer_signals(self, root: Path, result: ScanResult) -> None:
+        data = self._load_composer(root)
+        if data is None:
             return
 
         requirements = {
@@ -215,11 +209,15 @@ class OmekaSAnalyzer:
             self._append_unique_auth(result, "omeka_surface:site", relative)
 
     @staticmethod
-    def _read_text(path: Path) -> str | None:
-        try:
-            return path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+    def _load_composer(root: Path) -> dict | None:
+        text = read_source(root / "composer.json", root=root)
+        if text is None:
             return None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
 
     @staticmethod
     def _append_unique_route(result: ScanResult, path: str, method: str, file: str) -> None:
