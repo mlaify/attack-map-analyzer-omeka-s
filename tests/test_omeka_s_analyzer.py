@@ -41,7 +41,7 @@ def test_analyze_extracts_omeka_surfaces_and_services() -> None:
     result = analyzer.analyze(FIXTURES / "omeka_s_app")
 
     route_paths = {route.path for route in result.routes}
-    auth_hints = {hint.hint for hint in result.auth_hints}
+    framework_hints = {hint.hint for hint in result.framework_hints}
     external_targets = {call.target for call in result.external_calls}
     database_kinds = {hint.kind for hint in result.databases}
 
@@ -49,14 +49,17 @@ def test_analyze_extracts_omeka_surfaces_and_services() -> None:
     assert "/api" in route_paths
     assert "/s/:site-slug" in route_paths
 
-    assert "omeka_surface:admin" in auth_hints
-    assert "omeka_surface:api" in auth_hints
-    assert "omeka_surface:site" in auth_hints
-    assert "omeka_extension:service_manager" in auth_hints
-    assert "omeka_extension:navigation" in auth_hints
-    assert any(hint.startswith("controller:Application\\Controller\\") for hint in auth_hints)
-    assert any(hint.startswith("service:Omeka\\Connection") for hint in auth_hints)
-    assert any(hint.startswith("omeka_service:Connection") for hint in auth_hints)
+    # Omeka/Laminas metadata is a FrameworkHint, not an AuthHint (AttackMap#258).
+    assert "omeka_surface:admin" in framework_hints
+    assert "omeka_surface:api" in framework_hints
+    assert "omeka_surface:site" in framework_hints
+    assert "omeka_extension:service_manager" in framework_hints
+    assert "omeka_extension:navigation" in framework_hints
+    assert "omeka_dependency" in framework_hints
+    assert any(hint.startswith("controller:Application\\Controller\\") for hint in framework_hints)
+    assert any(hint.startswith("service:Omeka\\Connection") for hint in framework_hints)
+    assert any(hint.startswith("omeka_service:Connection") for hint in framework_hints)
+    assert result.auth_hints == []
 
     assert "sql" in database_kinds
     assert "https://collector.example.net/ingest" in external_targets
@@ -101,7 +104,7 @@ def test_repo_checked_out_under_skip_dir_name_is_still_analyzed(tmp_path: Path, 
     result = analyzer.analyze(repo)
     assert result.files_scanned > 0
     assert result.routes
-    assert result.auth_hints
+    assert result.framework_hints
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
@@ -127,3 +130,13 @@ def test_detect_does_not_follow_symlink_out_of_repo(tmp_path: Path) -> None:
     repo.mkdir()
     (repo / "Module.php").symlink_to(outside / "Module.php")
     assert OmekaSAnalyzer().detect(repo) is False
+
+
+def test_framework_hints_cite_their_source_line() -> None:
+    result = OmekaSAnalyzer().analyze(FIXTURES / "omeka_s_app")
+    for hint in result.framework_hints:
+        lines = (FIXTURES / "omeka_s_app" / hint.file).read_text().split("\n")
+        if hint.evidence_text.startswith("inferred from path"):
+            assert hint.line == 1  # path-derived (omeka_extension:module)
+        else:
+            assert hint.evidence_text == lines[hint.line - 1].strip()
