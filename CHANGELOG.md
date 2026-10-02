@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — typed signals instead of overloaded `AuthHint`s (AttackMap#258)
+
+- **No more non-auth `AuthHint`s.** Every hint this analyzer emitted as an `AuthHint` was Omeka/Laminas framework metadata, so it now emits them as `FrameworkHint` (`framework_hints`) with the same hint strings. Core's Omeka/MVC chain linker (`omeka_dependency`, `omeka_extension:`, `omeka_surface:`, `laminas_dependency`, `controller:`, `service:`) already reads `framework_hints`:
+  - `controller:<FQCN>`, `laminas_controller_mapping`, `service:<FQCN>` → `FrameworkHint`
+  - `omeka_service:*`, `omeka_extension:*`, `omeka_surface:*` → `FrameworkHint`
+  - `omeka_dependency`, `laminas_dependency` (composer.json) → `FrameworkHint`
+  The analyzer has no auth detectors of its own, so `auth_hints` is now always empty; generic PHP auth signals come from `php-web`.
+- **Every signal now cites a line and quotes it.** Routes, external calls, databases, framework hints and secret hints carry `line` and (where the model has it) `evidence_text` via `attackmap.sdk.line_of` / `line_snippet`. Composer-declared dependencies point at the package's line in `composer.json`; `omeka_extension:module` (derived from the file living under `module/`) is anchored at line 1 with `evidence_text: "inferred from path <file>"`. Framework hints set `confidence` (0.9 dependencies, 0.8 controllers, 0.7 services/extension keys/path surfaces, 0.6 route-name surfaces and module paths).
+- **Breaking for direct consumers of `ScanResult.auth_hints`:** code that looked for Omeka/Laminas hints in `auth_hints` must read `framework_hints`. AttackMap core already does.
+- New `tests/test_signal_conformance.py` asserts the analyzer emits no non-auth `AuthHint` and every signal has an in-range `line` and evidence.
+
 ### Fixed — AttackMap#253
 
 - **Repo walking now uses `attackmap.sdk.fs`.** `detect()` and `analyze()` walk with `iter_repo_files` and read with `read_source`. Skip dirs are matched by repo-relative name and pruned, so a repo checked out under a `vendor/` directory is analyzed instead of yielding no PHP files.

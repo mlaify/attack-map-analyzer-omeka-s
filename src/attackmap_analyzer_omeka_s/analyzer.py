@@ -4,9 +4,9 @@ import json
 import re
 from pathlib import Path
 
-from attackmap.sdk import iter_repo_files, read_source, rel
+from attackmap.sdk import iter_repo_files, line_of, line_snippet, read_source, rel
 
-from .contracts import AnalyzerMetadata, AuthHint, DatabaseHint, ExternalCall, Route, ScanResult, SecretHint
+from .contracts import AnalyzerMetadata, DatabaseHint, ExternalCall, FrameworkHint, Route, ScanResult, SecretHint
 
 ROUTE_PATH_PATTERN = re.compile(r"['\"]route['\"]\s*=>\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
 ROUTE_NAME_PATTERN = re.compile(r"['\"]([A-Za-z0-9_\\-]+)['\"]\s*=>\s*\[\s*['\"]type['\"]\s*=>", re.IGNORECASE)
@@ -29,6 +29,13 @@ SECRET_PATTERNS = [
     re.compile(r"getenv\s*\(\s*['\"]([A-Z0-9_]*(SECRET|TOKEN|KEY|PASSWORD|API|DB)[A-Z0-9_]*)['\"]", re.IGNORECASE),
     re.compile(r"\$_ENV\s*\[\s*['\"]([A-Z0-9_]*(SECRET|TOKEN|KEY|PASSWORD|API|DB)[A-Z0-9_]*)['\"]\s*\]", re.IGNORECASE),
 ]
+# Module-config keys that bind Omeka/Laminas extension points.
+EXTENSION_KEY_PATTERNS = [
+    (re.compile(r"['\"]service_manager['\"]", re.IGNORECASE), "omeka_extension:service_manager"),
+    (re.compile(r"['\"]factories['\"]", re.IGNORECASE), "omeka_extension:factory"),
+    (re.compile(r"['\"]navigation['\"]", re.IGNORECASE), "omeka_extension:navigation"),
+]
+DATASTORE_PATTERN = re.compile(r"omeka\\connection|new pdo\(|doctrine", re.IGNORECASE)
 
 
 class OmekaSAnalyzer:
@@ -116,8 +123,9 @@ class OmekaSAnalyzer:
         return False
 
     def _extract_composer_signals(self, root: Path, result: ScanResult) -> None:
+        text = read_source(root / "composer.json", root=root)
         data = self._load_composer(root)
-        if data is None:
+        if data is None or text is None:
             return
 
         requirements = {
@@ -126,87 +134,92 @@ class OmekaSAnalyzer:
         }
         for package in requirements:
             lowered = package.lower()
+            offset = self._composer_offset(text, package)
             if lowered.startswith("omeka/") or lowered == "omeka-s":
-                self._append_unique_auth(result, "omeka_dependency", "composer.json")
+                self._append_framework(result, "omeka_dependency", "composer.json", text, offset, 0.9)
             if lowered.startswith("laminas/") or lowered.startswith("zendframework/"):
-                self._append_unique_auth(result, "laminas_dependency", "composer.json")
+                self._append_framework(result, "laminas_dependency", "composer.json", text, offset, 0.9)
             if "doctrine" in lowered:
-                self._append_unique_database(result, "sql", "composer.json")
+                self._append_unique_database(result, "sql", "composer.json", text, offset)
 
     def _extract_routes_and_surfaces(self, content: str, relative: str, result: ScanResult) -> None:
         for match in ROUTE_PATH_PATTERN.finditer(content):
             path = match.group(1)
-            self._append_unique_route(result, path, "ANY", relative)
-            self._append_surface_hint_for_path(result, path, relative)
+            self._append_unique_route(result, path, "ANY", relative, line_of(content, match.start()))
+            self._append_surface_hint_for_path(result, path, relative, content, match.start())
 
         for match in ROUTE_NAME_PATTERN.finditer(content):
             route_name = match.group(1).lower()
-            if "admin" in route_name:
-                self._append_unique_auth(result, "omeka_surface:admin", relative)
-            elif "api" in route_name:
-                self._append_unique_auth(result, "omeka_surface:api", relative)
-            elif "site" in route_name:
-                self._append_unique_auth(result, "omeka_surface:site", relative)
+            for surface in ("admin", "api", "site"):
+                if surface in route_name:
+                    self._append_framework(result, f"omeka_surface:{surface}", relative, content, match.start(), 0.6)
+                    break
 
     def _extract_controllers_and_services(self, content: str, relative: str, result: ScanResult) -> None:
-        found_controller = False
+        first_controller: int | None = None
         for match in CONTROLLER_PATTERN.finditer(content):
             if "controller" not in match.group(1).lower():
                 continue
-            found_controller = True
-            self._append_unique_auth(result, f"controller:{match.group(1)}", relative)
-        if found_controller:
-            self._append_unique_auth(result, "laminas_controller_mapping", relative)
+            if first_controller is None:
+                first_controller = match.start()
+            self._append_framework(result, f"controller:{match.group(1)}", relative, content, match.start(), 0.8)
+        if first_controller is not None:
+            self._append_framework(result, "laminas_controller_mapping", relative, content, first_controller, 0.8)
 
         for match in SERVICE_PATTERN.finditer(content):
             service_name = match.group(1)
             if not _SERVICE_WORD.search(service_name):
                 continue
-            self._append_unique_auth(result, f"service:{service_name}", relative)
+            self._append_framework(result, f"service:{service_name}", relative, content, match.start(), 0.7)
             if "Connection" in service_name:
-                self._append_unique_database(result, "sql", relative)
+                self._append_unique_database(result, "sql", relative, content, match.start())
 
         for match in OMEKA_SERVICE_PATTERN.finditer(content):
             service_name = match.group(1)
-            self._append_unique_auth(result, f"omeka_service:{service_name}", relative)
+            self._append_framework(result, f"omeka_service:{service_name}", relative, content, match.start(), 0.7)
             if service_name.lower().endswith("connection"):
-                self._append_unique_database(result, "sql", relative)
+                self._append_unique_database(result, "sql", relative, content, match.start())
 
     def _extract_extension_points(self, content: str, relative: str, result: ScanResult) -> None:
-        lowered = content.lower()
-        if "'service_manager'" in lowered or '"service_manager"' in lowered:
-            self._append_unique_auth(result, "omeka_extension:service_manager", relative)
-        if "'factories'" in lowered or '"factories"' in lowered:
-            self._append_unique_auth(result, "omeka_extension:factory", relative)
-        if "'navigation'" in lowered or '"navigation"' in lowered:
-            self._append_unique_auth(result, "omeka_extension:navigation", relative)
+        for pattern, hint in EXTENSION_KEY_PATTERNS:
+            match = pattern.search(content)
+            if match:
+                self._append_framework(result, hint, relative, content, match.start(), 0.7)
         normalized = relative.replace("\\", "/")
         if "/module/" in f"/{normalized}/":
-            self._append_unique_auth(result, "omeka_extension:module", relative)
+            # Derived from the file's location, not a source line: anchor at line 1.
+            self._append_framework(
+                result, "omeka_extension:module", relative, None, None, 0.6, evidence=f"inferred from path {relative}"
+            )
 
     def _extract_external_calls(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern in OUTBOUND_PATTERNS:
             for match in pattern.finditer(content):
-                self._append_unique_external(result, match.group(1), relative)
+                self._append_unique_external(result, match.group(1), relative, content, match.start())
 
     def _extract_datastores(self, content: str, relative: str, result: ScanResult) -> None:
-        lowered = content.lower()
-        if "omeka\\connection" in lowered or "new pdo(" in lowered or "doctrine" in lowered:
-            self._append_unique_database(result, "sql", relative)
+        match = DATASTORE_PATTERN.search(content)
+        if match:
+            self._append_unique_database(result, "sql", relative, content, match.start())
 
     def _extract_secret_hints(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern in SECRET_PATTERNS:
             for match in pattern.finditer(content):
-                self._append_unique_secret(result, match.group(1), relative)
+                self._append_unique_secret(result, match.group(1), relative, content, match.start())
 
-    def _append_surface_hint_for_path(self, result: ScanResult, path: str, relative: str) -> None:
+    def _append_surface_hint_for_path(
+        self, result: ScanResult, path: str, relative: str, content: str, offset: int
+    ) -> None:
         lowered = path.lower()
+        surface = None
         if lowered.startswith("/admin") or "/admin/" in lowered:
-            self._append_unique_auth(result, "omeka_surface:admin", relative)
+            surface = "admin"
         elif lowered.startswith("/api") or "/api/" in lowered:
-            self._append_unique_auth(result, "omeka_surface:api", relative)
+            surface = "api"
         elif lowered.startswith("/s/") or lowered.startswith("/site"):
-            self._append_unique_auth(result, "omeka_surface:site", relative)
+            surface = "site"
+        if surface:
+            self._append_framework(result, f"omeka_surface:{surface}", relative, content, offset, 0.7)
 
     @staticmethod
     def _load_composer(root: Path) -> dict | None:
@@ -220,36 +233,72 @@ class OmekaSAnalyzer:
         return data if isinstance(data, dict) else None
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str) -> None:
+    def _composer_offset(text: str, package: str) -> int:
+        """Offset of a package's `"name": "constraint"` entry in composer.json (0 if not found)."""
+        index = text.find(f'"{package}"')
+        return index if index >= 0 else 0
+
+    @staticmethod
+    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int) -> None:
         key = (path, method, file)
         if any((item.path, item.method, item.file) == key for item in result.routes):
             return
-        result.routes.append(Route(path=path, method=method, file=file))
+        result.routes.append(Route(path=path, method=method, file=file, line=line))
 
     @staticmethod
-    def _append_unique_external(result: ScanResult, target: str, file: str) -> None:
+    def _append_unique_external(result: ScanResult, target: str, file: str, content: str, offset: int) -> None:
         key = (target, file)
         if any((item.target, item.file) == key for item in result.external_calls):
             return
-        result.external_calls.append(ExternalCall(target=target, file=file))
+        line = line_of(content, offset)
+        result.external_calls.append(
+            ExternalCall(target=target, file=file, line=line, evidence_text=line_snippet(content, line) or target)
+        )
 
     @staticmethod
-    def _append_unique_database(result: ScanResult, kind: str, file: str) -> None:
+    def _append_unique_database(result: ScanResult, kind: str, file: str, content: str, offset: int) -> None:
         key = (kind, file)
         if any((item.kind, item.file) == key for item in result.databases):
             return
-        result.databases.append(DatabaseHint(kind=kind, file=file))
+        line = line_of(content, offset)
+        result.databases.append(
+            DatabaseHint(kind=kind, file=file, line=line, evidence_text=line_snippet(content, line) or kind)
+        )
 
     @staticmethod
-    def _append_unique_auth(result: ScanResult, hint: str, file: str) -> None:
-        key = (hint, file)
-        if any((item.hint, item.file) == key for item in result.auth_hints):
+    def _append_framework(
+        result: ScanResult,
+        hint: str,
+        file: str,
+        content: str | None,
+        offset: int | None,
+        confidence: float,
+        *,
+        evidence: str | None = None,
+    ) -> None:
+        """Append a FrameworkHint once per (hint, file).
+
+        Located at ``offset`` when given; path-derived hints pass
+        ``content=None`` and are anchored at line 1 with ``evidence``.
+        """
+        if any((item.hint, item.file) == (hint, file) for item in result.framework_hints):
             return
-        result.auth_hints.append(AuthHint(hint=hint, file=file))
+        if content is not None and offset is not None:
+            line = line_of(content, offset)
+            evidence_text = line_snippet(content, line) or hint
+        else:
+            line = 1
+            evidence_text = evidence or hint
+        result.framework_hints.append(
+            FrameworkHint(hint=hint, file=file, line=line, evidence_text=evidence_text, confidence=confidence)
+        )
 
     @staticmethod
-    def _append_unique_secret(result: ScanResult, name: str, file: str) -> None:
+    def _append_unique_secret(result: ScanResult, name: str, file: str, content: str, offset: int) -> None:
         key = (name, file)
         if any((item.name, item.file) == key for item in result.secret_hints):
             return
-        result.secret_hints.append(SecretHint(name=name, file=file))
+        line = line_of(content, offset)
+        result.secret_hints.append(
+            SecretHint(name=name, file=file, line=line, evidence_text=line_snippet(content, line) or name)
+        )
