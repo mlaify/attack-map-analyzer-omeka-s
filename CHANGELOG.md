@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — false positives on ordinary PHP (port of mlaify/attackmap-analyzer-php-web#2)
+
+- **Route names are not routes.** `'route' =>` values must be URL path specs: rooted (`/harvester[/:action]`) or an optional child segment (`[/:id]`). Omeka module admin navigation (`'navigation' => ['AdminModule' => [['route' => 'admin/harvester']]]`) no longer yields `ANY admin/harvester` routes. This is the Laminas form of php-web's config `'path' =>` fix.
+- **`DB_*` / `API_*` settings are not secrets.** Secret env names must contain `SECRET`, `TOKEN`, `KEY`, `PASSWORD` or `PASSWD`, matched case-sensitively. `getenv('DB_HOST')`, `$_ENV['API_URL']` and lower-case names such as `getenv('cache_key_prefix')` no longer match; `DB_PASSWORD`, `API_KEY` and `API_TOKEN` still do.
+- Not applicable here: php-web's Slim `$x->get('/…')` receiver check (no Slim/FastRoute extraction), its `jwt` / `auth` tightening (this analyzer emits no auth hints) and its `detect()` fix (this `detect()` already needs an `omeka/` composer dependency, `module/` + `config/application.config.php` + a `module.config.php`, or `namespace Omeka` / `Omeka\Connection` in a non-vendored PHP file).
+
 ### Changed — typed signals instead of overloaded `AuthHint`s (AttackMap#258)
 
 - **No more non-auth `AuthHint`s.** Every hint this analyzer emitted as an `AuthHint` was Omeka/Laminas framework metadata, so it now emits them as `FrameworkHint` (`framework_hints`) with the same hint strings. Core's Omeka/MVC chain linker (`omeka_dependency`, `omeka_extension:`, `omeka_surface:`, `laminas_dependency`, `controller:`, `service:`) already reads `framework_hints`:

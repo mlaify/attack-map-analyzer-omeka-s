@@ -12,7 +12,8 @@
 
 It focuses on Omeka S and emits structured scan signals for:
 - likely admin, site, and API surfaces
-- route and controller hints from Laminas-style module config
+- route and controller hints from Laminas-style module config (router `'route' => '/path'` specs; navigation's `'route' => 'admin/my-module'` names a route and is not one)
+- secret-shaped env var names (`getenv`, `$_ENV`) containing `SECRET`, `TOKEN`, `KEY`, `PASSWORD` or `PASSWD`, matched case-sensitively; `DB_HOST`-style connection settings are not secrets
 - Omeka service usage (for example `Omeka\\Connection`)
 - module extension points such as navigation and service manager factories
 
