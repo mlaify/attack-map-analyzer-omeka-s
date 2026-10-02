@@ -8,7 +8,12 @@ from attackmap.sdk import iter_repo_files, line_of, line_snippet, read_source, r
 
 from .contracts import AnalyzerMetadata, DatabaseHint, ExternalCall, FrameworkHint, Route, ScanResult, SecretHint
 
-ROUTE_PATH_PATTERN = re.compile(r"['\"]route['\"]\s*=>\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
+# Laminas router `'options' => ['route' => '/my-module[/:id]']`. Only URL
+# path specs: rooted (`/...`) or an optional child segment (`[/:id]`). Omeka
+# module `navigation` pages use the same key for a route *name*
+# (`'route' => 'admin/my-module'`), which is not a path (port of
+# mlaify/attackmap-analyzer-php-web#2's config-path fix).
+ROUTE_PATH_PATTERN = re.compile(r"['\"]route['\"]\s*=>\s*['\"]([/\[][^'\"]*)['\"]", re.IGNORECASE)
 ROUTE_NAME_PATTERN = re.compile(r"['\"]([A-Za-z0-9_\\-]+)['\"]\s*=>\s*\[\s*['\"]type['\"]\s*=>", re.IGNORECASE)
 # `Foo\\BarController::class` — whole token matched possessively, keyword
 # checked in Python (see the service pattern below; mlaify/AttackMap#236).
@@ -25,9 +30,14 @@ OUTBOUND_PATTERNS = [
     re.compile(r"file_get_contents\s*\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
     re.compile(r"->(?:get|post|put|patch|delete|request)\s*\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
 ]
+# Secret-shaped env var names only. `API`/`DB` on their own matched
+# `DB_HOST`/`API_URL`; `DB_PASSWORD`/`API_KEY`/`API_TOKEN` still match via
+# PASSWORD/KEY/TOKEN. Case-sensitive: env var names are upper-case
+# (port of mlaify/attackmap-analyzer-php-web#2).
+_SECRET_NAME = r"([A-Z0-9_]*(?:SECRET|TOKEN|KEY|PASSWORD|PASSWD)[A-Z0-9_]*)"
 SECRET_PATTERNS = [
-    re.compile(r"getenv\s*\(\s*['\"]([A-Z0-9_]*(SECRET|TOKEN|KEY|PASSWORD|API|DB)[A-Z0-9_]*)['\"]", re.IGNORECASE),
-    re.compile(r"\$_ENV\s*\[\s*['\"]([A-Z0-9_]*(SECRET|TOKEN|KEY|PASSWORD|API|DB)[A-Z0-9_]*)['\"]\s*\]", re.IGNORECASE),
+    re.compile(r"getenv\s*\(\s*['\"]" + _SECRET_NAME + r"['\"]"),
+    re.compile(r"\$_ENV\s*\[\s*['\"]" + _SECRET_NAME + r"['\"]\s*\]"),
 ]
 # Module-config keys that bind Omeka/Laminas extension points.
 EXTENSION_KEY_PATTERNS = [

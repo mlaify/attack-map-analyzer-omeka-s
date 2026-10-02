@@ -140,3 +140,22 @@ def test_framework_hints_cite_their_source_line() -> None:
             assert hint.line == 1  # path-derived (omeka_extension:module)
         else:
             assert hint.evidence_text == lines[hint.line - 1].strip()
+
+
+# ---------------------------------------------------------------------------
+# False positives on ordinary PHP (port of mlaify/attackmap-analyzer-php-web#2)
+# ---------------------------------------------------------------------------
+
+NOISE = FIXTURES / "omeka_module_noise"
+
+
+def test_navigation_route_names_are_not_routes() -> None:
+    # Omeka admin navigation `'route' => 'admin/harvester'` names a route;
+    # only the router's path specs are routes.
+    result = OmekaSAnalyzer().analyze(NOISE)
+    assert {(r.path, r.method) for r in result.routes} == {("/harvester[/:action]", "ANY"), ("[/:id]", "ANY")}
+
+
+def test_db_and_api_connection_settings_are_not_secrets() -> None:
+    result = OmekaSAnalyzer().analyze(NOISE)
+    assert {s.name for s in result.secret_hints} == {"DB_PASSWORD", "API_TOKEN"}

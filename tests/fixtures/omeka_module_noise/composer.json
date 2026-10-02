@@ -1,0 +1,5 @@
+{
+  "name": "acme/omeka-s-module-harvester",
+  "type": "omeka-s-module",
+  "require-dev": { "omeka/omeka-s": "^4.0" }
+}
