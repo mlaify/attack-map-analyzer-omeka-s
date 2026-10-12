@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Per-route access on `Route.auth` / `guards` / `guard_evidence`** (core contract AttackMap#256). `$acl->allow()` / `->deny()` rules in `Module.php` and `*AclFactory.php` are parsed (roles, resources resolved through `namespace`/`use`, privileges, assertions) and matched to each route's controller and action: an unconditional allow for `null`/`'guest'` makes it `anonymous`; an anonymous deny or Omeka's default deny makes it `required` (`omeka_acl:requires_role(<role>)` / `omeka_acl:default_deny`); conditional or unresolved rules leave it `unknown`. `__ADMIN__` routes are `required` (`omeka:admin_login`).
 - **API key auth**: `__KEYAUTH__` routes (`/api`) note `key_identity`/`key_credential` in `guard_evidence`, and a `protocol:omeka_api_key` `ProtocolHint` is emitted for them and for code reading the parameters.
-- Omeka S core real world: 40 routes, 27 `anonymous` and 13 `required` (all hand-checked against `AclFactory.php` and `routes.config.php`); 2 API-key protocol hints.
+- ACL lookup follows Laminas' order (specific resource before all resources, role rules before all-roles rules, privilege before all privileges, last rule per slot wins); `Acl::ROLE_*` constants resolve to their values (`Acl::ROLE_GUEST` is public like `'guest'`); controller aliases and unregistered controllers are not ACL resources (alias → `anonymous`, unregistered → `unknown`); `/install` and `/migrate` are never `required`. Rules are indexed and decisions memoised with a per-repo budget (2,000 controllers × 2,000 rules × 200 `:controller` routes: 0.07 s, was ~20 s).
+- Omeka S core real world: 40 routes, 27 `anonymous`, 12 `required`, 1 `unknown` (`/install`), all hand-checked against `AclFactory.php` and `routes.config.php`; 2 API-key protocol hints.
 
 ### Changed — structural routes and a cheap `detect()` (#2)
 

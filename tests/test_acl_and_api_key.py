@@ -100,10 +100,13 @@ def test_dynamic_controller_route_is_anonymous_only_if_every_controller_is() -> 
     assert route.guard_evidence.startswith("all 2 controllers under Omeka\\Controller\\Site:")
 
 
-def test_role_only_controller_in_core_requires_login() -> None:
+def test_install_route_is_not_required() -> None:
     install = _routes(CORE)[("/install", "ANY")]
-    # `$acl->allow('global_admin')` covers every resource; no anonymous rule.
-    assert (install.auth, install.guards) == ("required", ["omeka_acl:requires_role(global_admin)"])
+    # Only `allow('global_admin')` covers it once installed, but AclFactory's
+    # `$acl->allow()` grants everyone everything before installation, when
+    # MvcListeners redirects every request here.
+    assert (install.auth, install.guards) == ("unknown", [])
+    assert "isn't installed" in install.guard_evidence
 
 
 def test_unresolved_anonymous_allow_blocks_default_deny(tmp_path: Path) -> None:
@@ -114,7 +117,8 @@ def test_unresolved_anonymous_allow_blocks_default_deny(tmp_path: Path) -> None:
     )
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "module.config.php").write_text(
-        "<?php\nnamespace M;\nreturn ['router' => ['routes' => ['m' => ['type' => 'Literal', "
+        "<?php\nnamespace M;\nreturn ['controllers' => ['invokables' => [Controller\\IndexController::class => 'X']],\n"
+        "'router' => ['routes' => ['m' => ['type' => 'Literal', "
         "'options' => ['route' => '/m', 'defaults' => ['controller' => Controller\\IndexController::class]]]]]];\n"
     )
     route = OmekaSAnalyzer().analyze(tmp_path).routes[0]
@@ -132,11 +136,20 @@ def test_no_decision_outside_an_omeka_repo(tmp_path: Path) -> None:
     assert (route.path, route.auth) == ("/m", "unknown")
 
 
-def test_zero_argument_allow_is_ignored() -> None:
+def test_zero_argument_allow_outside_acl_factory_blocks_default_deny() -> None:
     source = "<?php $acl->allow(); $acl->allow(null, 'C'); $x->allowed('y');"
-    rules = acl_rules(tokenize(source), NameContext(), "f.php", lambda offset: 1)
-    assert len(rules) == 1 and rules[0].resources == ["C"]
-    assert Acl(rules).decide("C", "index").auth == "anonymous"
+    rules = acl_rules(tokenize(source), NameContext(), "Module.php", lambda offset: 1)
+    assert [r.grant_all for r in rules] == [True, False]
+    acl = Acl(rules)
+    assert acl.decide("C", "index").auth == "anonymous"
+    # A grant-all in a module might reach anything: no default-deny claims.
+    assert acl.decide("D", "index").auth == "unknown"
+
+
+def test_zero_argument_allow_in_acl_factory_is_the_install_grant() -> None:
+    source = "<?php $acl->allow(); $acl->allow('editor', 'D');"
+    acl = Acl(acl_rules(tokenize(source), NameContext(), "src/Service/AclFactory.php", lambda offset: 1))
+    assert acl.decide("D", "index").auth == "required"
 
 
 def test_role_constants_and_arrays() -> None:
@@ -159,7 +172,8 @@ def test_acl_rules_outside_module_or_acl_factory_are_ignored(tmp_path: Path) -> 
     (tmp_path / "src" / "Job.php").write_text("<?php\n$acl->allow(null, 'M\\\\Controller\\\\Index');\n")
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "module.config.php").write_text(
-        "<?php\nreturn ['router' => ['routes' => ['m' => ['type' => 'Literal', "
+        "<?php\nreturn ['controllers' => ['invokables' => ['M\\\\Controller\\\\Index' => 'X']],\n"
+        "'router' => ['routes' => ['m' => ['type' => 'Literal', "
         "'options' => ['route' => '/m', 'defaults' => ['controller' => 'M\\\\Controller\\\\Index']]]]]];\n"
     )
     route = OmekaSAnalyzer().analyze(tmp_path).routes[0]
@@ -390,3 +404,142 @@ def test_hostile_input_is_bounded(payload: str) -> None:
     Acl(acl_rules(tokens, NameContext(), "f.php", lambda offset: 1)).decide("X", None)
     analyzer_module._registered_controllers(tokens, NameContext())
     assert time.perf_counter() - start < 5.0
+
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: Laminas lookup order, registration, role constants, budget
+# ---------------------------------------------------------------------------
+
+
+def _acl(source: str, registered: set[str] | None = None, aliases: set[str] | None = None) -> Acl:
+    return Acl(acl_rules(tokenize(source), NameContext(), "Module.php", lambda offset: 1), registered, aliases)
+
+
+def test_specific_resource_rule_beats_an_all_resources_rule() -> None:
+    acl = _acl("<?php $acl->allow(null, 'A\\Controller\\Pub'); $acl->deny(null, null, ['delete']);")
+    # Laminas checks the specific resource first: its all-privileges allow
+    # settles `delete` before the all-resources deny is consulted.
+    decision = acl.decide("A\\Controller\\Pub", "delete")
+    assert decision.auth == "anonymous"
+    assert decision.evidence == "$acl->allow(null, 'A\\Controller\\Pub') at Module.php:1"
+    # Another controller falls through to the all-resources deny.
+    other = acl.decide("A\\Controller\\Other", "delete")
+    assert (other.auth, other.guards[0]) == ("required", "omeka_acl:deny_anonymous")
+    assert other.evidence == "$acl->deny(null, null, ['delete']) at Module.php:1"
+
+
+def test_all_roles_deny_on_a_resource_continues_to_all_resources() -> None:
+    # Laminas: an all-roles, all-privileges deny on the specific resource
+    # doesn't stop the lookup; the all-resources allow applies.
+    acl = _acl("<?php $acl->deny(null, 'X'); $acl->allow(null, null);")
+    assert acl.decide("X", "index").auth == "anonymous"
+
+
+def test_privilege_specific_deny_on_the_resource_wins() -> None:
+    acl = _acl("<?php $acl->allow(null, null); $acl->deny(null, 'X', ['edit']);")
+    assert acl.decide("X", "edit").auth == "required"
+    assert acl.decide("X", "show").auth == "anonymous"
+    # `:action` routes: some actions public, some not.
+    assert acl.decide("X", None).auth == "unknown"
+
+
+def test_last_rule_for_a_slot_wins() -> None:
+    acl = _acl("<?php $acl->allow(null, 'X', ['a']); $acl->deny(null, 'X', ['a']);")
+    assert acl.decide("X", "a").auth == "required"
+    acl = _acl("<?php $acl->deny(null, 'X', ['a']); $acl->allow(null, 'X', ['a']);")
+    assert acl.decide("X", "a").auth == "anonymous"
+
+
+def test_guest_role_constant_is_resolved_like_the_string() -> None:
+    for role in ("[Acl::ROLE_GUEST]", "Acl::ROLE_GUEST", "'guest'", "['guest']"):
+        acl = _acl(f"<?php $acl->allow({role}, 'X');")
+        assert acl.decide("X", "index").auth == "anonymous", role
+    acl = _acl("<?php $acl->allow(Acl::ROLE_SITE_ADMIN, 'X');")
+    assert acl.decide("X", "index").guards == ["omeka_acl:requires_role(site_admin)"]
+
+
+def test_guest_rules_beat_all_roles_rules_for_the_guest() -> None:
+    # The visitor is denied, but a guest's own allow comes first in its lookup.
+    acl = _acl("<?php $acl->deny(null, 'X', ['index']); $acl->allow('guest', 'X');")
+    assert acl.decide("X", "index").auth == "anonymous"
+
+
+def test_alias_controller_is_not_an_acl_resource() -> None:
+    acl = _acl("<?php $acl->allow('editor', 'Real');", registered={"Real"}, aliases={"Alias"})
+    alias = acl.decide("Alias", "index")
+    assert alias.auth == "anonymous"
+    assert "not an ACL resource" in alias.evidence
+    assert acl.decide("Real", "index").auth == "required"
+    # Not registered anywhere we saw: no claim.
+    assert acl.decide("Unknown", "index") .auth == "unknown"
+
+
+def test_route_to_alias_or_unregistered_controller_is_not_required(tmp_path: Path) -> None:
+    (tmp_path / "composer.json").write_text('{"type": "omeka-s-module"}')
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "module.config.php").write_text(
+        "<?php\nreturn ['controllers' => ['invokables' => ['M\\\\Real' => 'R'], 'aliases' => ['M\\\\Alias' => 'M\\\\Real']],\n"
+        "'router' => ['routes' => [\n"
+        "  'a' => ['type' => 'Literal', 'options' => ['route' => '/a', 'defaults' => ['controller' => 'M\\\\Alias']]],\n"
+        "  'u' => ['type' => 'Literal', 'options' => ['route' => '/u', 'defaults' => ['controller' => 'M\\\\Nowhere']]],\n"
+        "  'r' => ['type' => 'Literal', 'options' => ['route' => '/r', 'defaults' => ['controller' => 'M\\\\Real']]],\n"
+        "]]];\n"
+    )
+    routes = {r.path: r.auth for r in OmekaSAnalyzer().analyze(tmp_path).routes}
+    assert routes == {"/a": "anonymous", "/u": "unknown", "/r": "required"}
+
+
+def test_method_children_cover_every_form_of_an_optional_parent() -> None:
+    source = """<?php return ['router' => ['routes' => [
+        'user' => ['type' => 'Segment', 'options' => ['route' => '/user[/:id]'], 'child_routes' => [
+            'delete' => ['type' => 'Method', 'options' => ['verb' => 'delete']],
+        ]],
+    ]]];"""
+    found = {(r.path, r.method) for r in router_routes(route_trees(tokenize(source)))}
+    assert found == {("/user", "DELETE"), ("/user/:id", "DELETE")}
+
+
+def _big_repo(root: Path, controllers: int = 2000, rules: int = 2000, routes: int = 200) -> None:
+    (root / "composer.json").write_text('{"type": "omeka-s-module"}')
+    namespaces = 10
+    per = controllers // namespaces
+    (root / "Module.php").write_text(
+        "<?php\nnamespace Big;\nclass Module {\n  public function onBootstrap($e) {\n"
+        + "".join(
+            f"    $acl->allow({'null' if i % 3 == 0 else repr('editor')}, 'Big\\\\N{i % namespaces}\\\\C{i % per}', ['a{i % 7}']);\n"
+            for i in range(rules)
+        )
+        + "  }\n}\n"
+    )
+    (root / "config").mkdir()
+    invokables = "".join(f"'Big\\\\N{i % namespaces}\\\\C{i // namespaces}' => 'X',\n" for i in range(controllers))
+    route_entries = "".join(
+        f"'r{j}' => ['type' => 'Segment', 'options' => ['route' => '/r{j}/:controller[/:action[/:id]]', "
+        f"'defaults' => ['__NAMESPACE__' => 'Big\\\\N{j % namespaces}', 'action' => 'a{j % 5}']]],\n"
+        for j in range(routes)
+    )
+    (root / "config" / "module.config.php").write_text(
+        f"<?php\nreturn ['controllers' => ['invokables' => [\n{invokables}]],\n"
+        f"'router' => ['routes' => [\n{route_entries}]]];\n"
+    )
+
+
+def test_many_controllers_rules_and_dynamic_routes_stay_fast(tmp_path: Path) -> None:
+    _big_repo(tmp_path)
+    start = time.perf_counter()
+    result = OmekaSAnalyzer().analyze(tmp_path)
+    elapsed = time.perf_counter() - start
+    assert len(result.routes) == 600
+    # The pre-index version took ~20 s here (286 s on a larger case).
+    assert elapsed < 5.0, f"{elapsed:.1f}s"
+
+
+def test_decision_budget_degrades_to_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    from attackmap_analyzer_omeka_s import acl as acl_module
+
+    monkeypatch.setattr(acl_module, "MAX_DECISIONS", 2)
+    acl = _acl("<?php $acl->allow(null, null);")
+    assert [acl.decide(c, "x").auth for c in ("A", "B", "C")] == ["anonymous", "anonymous", "unknown"]
+    # Memoised decisions don't count against the budget.
+    assert acl.decide("A", "x").auth == "anonymous"

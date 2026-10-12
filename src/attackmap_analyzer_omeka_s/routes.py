@@ -44,10 +44,12 @@ optional `[...]` parts expand the same way.
 
 from __future__ import annotations
 
+import bisect
 import re
 from dataclasses import dataclass, field
 
 from .phparray import (
+    ARROW,
     LPAREN,
     OP,
     OPEN,
@@ -56,9 +58,11 @@ from .phparray import (
     PhpExpr,
     PhpString,
     PhpValue,
+    STR,
     Token,
+    TokenList,
     is_true,
-    keyed_arrays,
+    keyed_array_spans,
     parse_array_span,
     parse_call_args,
 )
@@ -199,29 +203,118 @@ def route_type(value: PhpValue | None) -> str | None:
 
 @dataclass
 class RouteNode:
-    """What a named route passes to its children: the (minimal) path they
-    join onto, the merged defaults and an inherited Method verb."""
+    """What a named route passes to its children: the minimal path child
+    routes join onto, the merged defaults, an inherited Method verb, and the
+    full template (optional parts included) that Method children expand."""
 
     prefix: str
     defaults: dict[str, PhpValue] = field(default_factory=dict)
     method: str | None = None
+    template: str | None = None
 
 
 def route_trees(tokens: list[Token]) -> list[PhpArray]:
     """The route maps in a file: every `'router' => ['routes' => [...]]`, or
-    else a file that just `return`s a route map."""
+    else a file that just `return`s a route map.
+
+    `'router' => $router` and `'routes' => $routes` follow a same-file
+    `$routes = [...]` assignment (the last one before the use, else the first
+    after it)."""
     trees: list[PhpArray] = []
-    for router in keyed_arrays(tokens, "router"):
+    variables = _VariableArrays(tokens)
+    seen: set[int] = set()  # the same `$router` used twice is walked once
+    alive: list[PhpArray] = []
+    i = 0
+    n = len(tokens)
+    while i < n - 2:
+        tok = tokens[i]
+        if tok.kind != STR or tok.text != "router" or tokens[i + 1].kind != ARROW:
+            i += 1
+            continue
+        router, end = variables.value_at(i + 2)
+        # Continue after a literal router array: a nested `'router' => [`
+        # was parsed with it, and re-parsing would be quadratic.
+        i = max(end, i + 1)
+        if router is None or id(router) in seen:
+            continue
+        seen.add(id(router))
+        alive.append(router)  # keep it alive so its id() isn't reused
         routes = router.get("routes")
-        if isinstance(routes, PhpArray):
+        if isinstance(routes, PhpExpr):
+            routes = variables.resolve(routes)
+        if isinstance(routes, PhpArray) and id(routes) not in seen:
+            seen.add(id(routes))
             trees.append(routes)
     return trees or _returned_route_maps(tokens)
+
+
+class _VariableArrays:
+    """`$name = [...]` assignments in a file, parsed on demand."""
+
+    MAX_PARSES = 64
+
+    def __init__(self, tokens: list[Token]) -> None:
+        self.tokens = tokens
+        self.assignments: dict[str, list[int]] = {}
+        self.cache: dict[int, PhpArray | None] = {}
+        self.parses = 0
+        n = len(tokens)
+        for i in range(n - 2):
+            tok = tokens[i]
+            if (
+                tok.kind == WORD
+                and tok.text.startswith("$")
+                and tokens[i + 1].kind == OP
+                and tokens[i + 1].text == "="
+                and tokens[i + 2].kind == OPEN
+            ):
+                self.assignments.setdefault(tok.text, []).append(i + 2)
+
+    def _array(self, index: int) -> PhpArray | None:
+        # Each assignment is parsed at most once, and at most MAX_PARSES are,
+        # so hostile files can't make variable lookups quadratic.
+        if index not in self.cache:
+            if self.parses >= self.MAX_PARSES:
+                return None
+            self.parses += 1
+            array, _ = parse_array_span(self.tokens, index)
+            self.cache[index] = array
+        return self.cache[index]
+
+    def value_at(self, index: int) -> tuple[PhpArray | None, int]:
+        """The array literal at token ``index`` (and the index after it), or
+        the array a `$var` there holds (and ``index + 1``)."""
+        if index >= len(self.tokens):
+            return None, index
+        tok = self.tokens[index]
+        if tok.kind == OPEN:
+            return parse_array_span(self.tokens, index)
+        if tok.kind == WORD and tok.text.startswith("$"):
+            return self._lookup(tok.text, tok.offset), index + 1
+        return None, index + 1
+
+    def resolve(self, value: PhpExpr) -> PhpArray | None:
+        name = value.text.strip()
+        if not name.startswith("$") or " " in name:
+            return None
+        return self._lookup(name, value.offset)
+
+    def _lookup(self, name: str, offset: int) -> PhpArray | None:
+        positions = self.assignments.get(name)
+        if not positions:
+            return None
+        # The last assignment before the use, else the first one: token
+        # indices ascend with offsets, so bisect on both.
+        use = bisect.bisect_left(self.tokens, offset, key=lambda tok: tok.offset)
+        at = bisect.bisect_left(positions, use)
+        return self._array(positions[at - 1] if at > 0 else positions[0])
 
 
 def router_routes(
     trees: list[PhpArray],
     known: dict[str, RouteNode] | None = None,
     index: dict[str, RouteNode] | None = None,
+    consumed: set[int] | None = None,
 ) -> list[LaminasRoute]:
     """Routes from a file's route maps (see :func:`route_trees`).
 
@@ -231,12 +324,14 @@ def router_routes(
     route name → :class:`RouteNode`); without an entry its children are
     skipped rather than reported as top-level paths. ``index``, when given,
     collects a :class:`RouteNode` for every named route walked, to build
-    ``known`` across files.
+    ``known`` across files. ``consumed``, when given, collects the source
+    offsets of the `'route'`/`'spec'`/`'verb'` strings the walk used, so a
+    caller can tell which literals it never reached.
     """
     out: list[LaminasRoute] = []
-    ctx = _WalkContext(out, known or {}, index)
+    ctx = _WalkContext(out, known or {}, index, consumed)
     for routes in trees:
-        _walk(routes, "", "", {}, None, 0, ctx)
+        _walk(routes, "", "", "", {}, None, 0, ctx)
     return out
 
 
@@ -245,6 +340,7 @@ class _WalkContext:
     out: list[LaminasRoute]
     known: dict[str, RouteNode]
     index: dict[str, RouteNode] | None
+    consumed: set[int] | None = None
 
 
 def _returned_route_maps(tokens: list[Token]) -> list[PhpArray]:
@@ -278,12 +374,15 @@ def _looks_like_route_spec(value: PhpValue) -> bool:
 def _walk(
     routes: PhpArray,
     prefix: str,
+    parent_template: str,
     prefix_name: str,
     defaults: dict[str, PhpValue],
     method: str | None,
     depth: int,
     ctx: _WalkContext,
 ) -> None:
+    """``prefix`` is the parent's minimal path (child routes join onto it);
+    ``parent_template`` keeps its optional parts, for Method children."""
     if depth > MAX_ROUTE_DEPTH:
         return
     out = ctx.out
@@ -309,7 +408,8 @@ def _walk(
             merged = dict(base.defaults)
             if isinstance(own_defaults, PhpArray):
                 merged.update(own_defaults.entries())
-            _walk(children, base.prefix, full_name, merged, base.method, depth + 1, ctx)
+            base_template = base.template if base.template is not None else base.prefix
+            _walk(children, base.prefix, base_template, full_name, merged, base.method, depth + 1, ctx)
             continue
 
         merged = dict(defaults)
@@ -317,31 +417,36 @@ def _walk(
             merged.update(own_defaults.entries())
 
         methods: list[str] | None = [method or "ANY"]
-        template = prefix
+        template = parent_template
         offset = spec.offset
+        literal: PhpValue | None = None
         if kind == "method":
-            verbs = _verbs(options.get("verb"))
+            literal = options.get("verb")
+            verbs = _verbs(literal)
             if not verbs:
                 continue
+            # The verb applies to every form of the parent: `/user[/:id]`
+            # with a `delete` child is `DELETE /user` and `DELETE /user/:id`.
             methods = verbs
-            verb_value = options.get("verb")
-            offset = verb_value.offset if verb_value is not None else offset
+            offset = literal.offset if literal is not None else offset
         elif kind in ("hostname", "scheme"):
             methods = None  # matches the host/scheme, not a path
         elif kind == "regex":
-            spec_value = options.get("spec")
-            if not isinstance(spec_value, PhpString) or not spec_value.value.startswith("/"):
+            literal = options.get("spec")
+            if not isinstance(literal, PhpString) or not literal.value.startswith("/"):
                 continue
-            template = prefix + _REGEX_SPEC_PARAM.sub(r":\1", spec_value.value)
-            offset = spec_value.offset
+            template = prefix + _REGEX_SPEC_PARAM.sub(r":\1", literal.value)
+            offset = literal.offset
         elif kind in _PATH_KINDS:
-            route = options.get("route")
-            if not isinstance(route, PhpString) or not route.value.startswith(("/", "[")):
+            literal = options.get("route")
+            if not isinstance(literal, PhpString) or not literal.value.startswith(("/", "[")):
                 continue
-            template = prefix + _segment_text(route.value)
-            offset = route.offset
+            template = prefix + _segment_text(literal.value)
+            offset = literal.offset
         else:
             continue  # Part, Wildcard, Query, console `simple`, custom types
+        if ctx.consumed is not None and literal is not None:
+            ctx.consumed.add(literal.offset)
 
         if terminates and methods is not None:
             for form in expand_optional(template):
@@ -350,9 +455,32 @@ def _walk(
                     out.append(LaminasRoute(path, verb, offset, full_name, template, merged))
         child_method = methods[0] if kind == "method" and methods and len(methods) == 1 else method
         if ctx.index is not None:
-            ctx.index.setdefault(full_name, RouteNode(minimal_form(template), merged, child_method))
+            ctx.index.setdefault(full_name, RouteNode(minimal_form(template), merged, child_method, template))
         if isinstance(children, PhpArray):
-            _walk(children, minimal_form(template), full_name, merged, child_method, depth + 1, ctx)
+            _walk(children, minimal_form(template), template, full_name, merged, child_method, depth + 1, ctx)
+
+
+def fallback_route_literals(
+    content: str, tokens: TokenList, consumed: set[int], pattern: re.Pattern[str]
+) -> list[tuple[str, int]]:
+    """Flat `'route' => '/path'` matches (``pattern`` group 1 is the path) that
+    the structural walk didn't consume: routes built in ways it can't follow,
+    or past the tokenizer's cap (``tokens.truncated``). A literal inside a
+    tokenized `child_routes` array is only a fragment of a path and is left
+    out; past a truncation the arrays are unknown, so every literal there is
+    kept. Returns ``(path, match offset)`` pairs."""
+    spans = keyed_array_spans(tokens, "child_routes")
+    starts = [start for start, _ in spans]
+    found: list[tuple[str, int]] = []
+    for match in pattern.finditer(content):
+        literal = match.start(1) - 1
+        if literal in consumed:
+            continue
+        at = bisect.bisect_right(starts, literal) - 1
+        if at >= 0 and spans[at][0] <= literal < spans[at][1]:
+            continue
+        found.append((match.group(1), match.start()))
+    return found
 
 
 def _verbs(value: PhpValue | None) -> list[str]:
@@ -457,6 +585,7 @@ def _route_methods(value: PhpValue | None) -> list[str]:
 
 __all__ = [
     "LaminasRoute",
+    "fallback_route_literals",
     "MezzioRoute",
     "RouteNode",
     "route_trees",

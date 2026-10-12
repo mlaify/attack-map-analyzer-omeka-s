@@ -7,7 +7,7 @@ return [
         'invokables' => [
             // Short name: the `site` child route resolves it via __NAMESPACE__.
             'Gallery\Controller\Site\Index' => Controller\Site\IndexController::class,
-            Controller\Admin\IndexController::class => Controller\Admin\IndexController::class,
+            'Gallery\Controller\Admin\Index' => Controller\Admin\IndexController::class,
             Controller\FeedController::class => Controller\FeedController::class,
             Controller\UploadController::class => Controller\UploadController::class,
             Controller\VoteController::class => Controller\VoteController::class,
@@ -42,7 +42,8 @@ return [
                         'options' => [
                             'route' => '/gallery[/:action]',
                             'defaults' => [
-                                'controller' => Controller\Admin\IndexController::class,
+                                '__NAMESPACE__' => 'Gallery\Controller\Admin',
+                                'controller' => 'Index',
                                 'action' => 'browse',
                             ],
                         ],

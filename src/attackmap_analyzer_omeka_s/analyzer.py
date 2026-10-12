@@ -19,6 +19,7 @@ from .contracts import (
 )
 from .phparray import (
     NameContext,
+    TokenList,
     PhpArray,
     PhpExpr,
     PhpString,
@@ -29,7 +30,7 @@ from .phparray import (
     keyed_arrays,
     tokenize,
 )
-from .routes import LaminasRoute, RouteNode, route_trees, router_routes
+from .routes import LaminasRoute, RouteNode, fallback_route_literals, route_trees, router_routes
 
 # Fallback for a file with no recognizable `'router' => ['routes' => ...]`
 # tree (see `routes.py` for the structural walk): Laminas router
@@ -154,8 +155,8 @@ def _is_acl_file(name: str) -> bool:
     return name in _ACL_FILE_NAMES or name.endswith(_ACL_FILE_SUFFIXES)
 
 
-# (file, content, route trees, names) awaiting the cross-file route index.
-_RouteFile = tuple[str, str, list[PhpArray], NameContext]
+# (file, content, tokens, route trees, names) awaiting the cross-file route index.
+_RouteFile = tuple[str, str, TokenList, list[PhpArray], NameContext]
 
 
 class OmekaSAnalyzer:
@@ -211,7 +212,9 @@ class OmekaSAnalyzer:
 
         pending: list[_RouteFile] = []
         rules: list[AclRule] = []
-        controllers: set[str] = set()
+        registered: set[str] = set()
+        aliases: set[str] = set()
+        seen: set[tuple[str, str, str]] = set()
         # Pruned by repo-relative dir name (vendor, node_modules, .git, ...);
         # symlinks out of the repo are not followed (AttackMap#253).
         for file_path in iter_repo_files(root, suffixes={".php"}):
@@ -228,13 +231,17 @@ class OmekaSAnalyzer:
             has_routes = "'route" in content or '"route' in content
             has_rules = _is_acl_file(file_path.name) and ("->allow" in content or "->deny" in content)
             has_controllers = "'controllers'" in content or '"controllers"' in content
-            tokens = tokenize(content) if has_routes or has_rules or has_controllers else []
+            tokens = tokenize(content) if has_routes or has_rules or has_controllers else TokenList()
             names = NameContext.of(content) if tokens else NameContext()
-            self._extract_routes_and_surfaces(content, relative, result, pending, tokens, names)
+            if has_routes:
+                pending.append((relative, content, tokens, route_trees(tokens), names))
+            self._extract_route_name_surfaces(content, relative, result)
             if has_rules:
                 rules.extend(acl_rules(tokens, names, relative, lambda offset, c=content: line_of(c, offset)))
             if has_controllers:
-                controllers.update(_registered_controllers(tokens, names))
+                found_registered, found_aliases = _registered_controllers(tokens, names)
+                registered.update(found_registered)
+                aliases.update(found_aliases)
             self._extract_controllers_and_services(content, relative, result)
             self._extract_extension_points(content, relative, result)
             self._extract_external_calls(content, relative, result)
@@ -243,7 +250,8 @@ class OmekaSAnalyzer:
             self._extract_api_key_params(content, relative, result)
 
         omeka_app = bool(rules) or self._has_omeka_composer_signals(root) or self._has_omeka_layout(root)
-        self._emit_router_routes(pending, Acl(rules), controllers, omeka_app, result)
+        acl = Acl(rules, registered, aliases)
+        self._emit_router_routes(pending, acl, registered | aliases, omeka_app, result, seen)
         result.languages.sort()
         return result
 
@@ -287,31 +295,7 @@ class OmekaSAnalyzer:
             if "doctrine" in lowered:
                 self._append_unique_database(result, "sql", "composer.json", text, offset)
 
-    def _extract_routes_and_surfaces(
-        self,
-        content: str,
-        relative: str,
-        result: ScanResult,
-        pending: list[_RouteFile],
-        tokens: list[Token],
-        names: NameContext,
-    ) -> None:
-        """Route-name surfaces and fallback routes now; router trees go to
-        ``pending`` for :meth:`_emit_router_routes`, which needs every file's
-        route names and ACL rules."""
-        trees = route_trees(tokens) if tokens else []
-        if trees:
-            pending.append((relative, content, trees, names))
-
-        # A child route's `'route' => '[/:id]'` is only a fragment of a path,
-        # so the flat literal fallback is for files with no router tree at all.
-        if not trees and "child_routes" not in content:
-            for match in ROUTE_PATH_PATTERN.finditer(content):
-                path = match.group(1)
-                line = line_of(content, match.start())
-                self._append_unique_route(result, Route(path=path, file=relative, line=line))
-                self._append_surface_hint_for_path(result, path, relative, content, match.start())
-
+    def _extract_route_name_surfaces(self, content: str, relative: str, result: ScanResult) -> None:
         for match in ROUTE_NAME_PATTERN.finditer(content):
             route_name = match.group(1).lower()
             for surface in ("admin", "api", "site"):
@@ -325,7 +309,13 @@ class OmekaSAnalyzer:
             self._append_protocol(result, relative, content, line_of(content, match.start()))
 
     def _emit_router_routes(
-        self, pending: list[_RouteFile], acl: Acl, controllers: set[str], omeka_app: bool, result: ScanResult
+        self,
+        pending: list[_RouteFile],
+        acl: Acl,
+        controllers: set[str],
+        omeka_app: bool,
+        result: ScanResult,
+        seen: set,
     ) -> None:
         # Laminas merges all modules' config: index every named route first
         # (on top of Omeka core's well-known parents) so a module's
@@ -333,22 +323,25 @@ class OmekaSAnalyzer:
         index: dict[str, RouteNode] = {}
         for _ in range(3):
             before = len(index)
-            for _relative, _content, trees, _names in pending:
+            for _relative, _content, _tokens, trees, _names in pending:
                 router_routes(trees, known={**OMEKA_CORE_ROUTES, **index}, index=index)
             if len(index) == before:
                 break
         known = {**OMEKA_CORE_ROUTES, **index}
-        for relative, content, trees, names in pending:
+        decider = _Decider(acl, controllers, omeka_app)
+        for relative, content, tokens, trees, names in pending:
             keyauth_line: int | None = None
-            for found in router_routes(trees, known=known):
+            consumed: set[int] = set()
+            for found in router_routes(trees, known=known, consumed=consumed):
                 line = line_of(content, found.offset)
-                decision = self._decide(found, names, acl, controllers, omeka_app)
+                decision = decider.decide(found, names)
                 evidence = decision.evidence
                 if is_true(found.defaults.get("__KEYAUTH__")):
                     keyauth_line = keyauth_line or line
                     evidence = f"{evidence}; {_API_KEY_NOTE}" if evidence else _API_KEY_NOTE
                 self._append_unique_route(
                     result,
+                    seen,
                     Route(
                         path=found.path,
                         method=found.method,
@@ -360,44 +353,16 @@ class OmekaSAnalyzer:
                     ),
                 )
                 self._append_surface_hint_for_path(result, found.path, relative, content, found.offset)
+            # Literals the walk never reached (routes built in a way it can't
+            # follow, or past the tokenizer cap) keep the flat match.
+            for path, offset in fallback_route_literals(content, tokens, consumed, ROUTE_PATH_PATTERN):
+                route = Route(path=path, file=relative, line=line_of(content, offset))
+                self._append_unique_route(result, seen, route)
+                self._append_surface_hint_for_path(result, path, relative, content, offset)
             if keyauth_line is not None:
                 # Anchor on the file's own `'__KEYAUTH__' => true` if it has one.
                 own = content.find("__KEYAUTH__")
                 self._append_protocol(result, relative, content, line_of(content, own) if own >= 0 else keyauth_line)
-
-    @staticmethod
-    def _decide(
-        found: LaminasRoute, names: NameContext, acl: Acl, controllers: set[str], omeka_app: bool
-    ) -> Decision:
-        acl_decision = (
-            OmekaSAnalyzer._decide_acl(found, names, acl, controllers) if omeka_app else Decision("unknown")
-        )
-        if is_true(found.defaults.get("__ADMIN__")):
-            # Login first; the ACL's role check still applies after it.
-            if acl_decision.auth == "required":
-                return Decision(
-                    "required",
-                    ["omeka:admin_login", *acl_decision.guards],
-                    f"{_ADMIN_EVIDENCE}; {acl_decision.evidence}",
-                )
-            return Decision("required", ["omeka:admin_login"], _ADMIN_EVIDENCE)
-        return acl_decision
-
-    @staticmethod
-    def _decide_acl(found: LaminasRoute, names: NameContext, acl: Acl, controllers: set[str]) -> Decision:
-        defaults = found.defaults
-        namespace = _string(defaults.get("__NAMESPACE__"))
-        action = None if ":action" in found.path else _string(defaults.get("action"))
-        if ":controller" in found.path:
-            if not namespace:
-                return Decision("unknown")
-            prefix = namespace + "\\"
-            candidates = sorted(c for c in controllers if c.startswith(prefix) and "\\" not in c[len(prefix) :])
-            return combine([acl.decide(c, action) for c in candidates], namespace)
-        controller = _controller_name(defaults.get("controller"), namespace, names)
-        if controller is None:
-            return Decision("unknown")
-        return acl.decide(controller, action)
 
     def _extract_controllers_and_services(self, content: str, relative: str, result: ScanResult) -> None:
         first_controller: int | None = None
@@ -483,10 +448,11 @@ class OmekaSAnalyzer:
         return index if index >= 0 else 0
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, route: Route) -> None:
+    def _append_unique_route(result: ScanResult, seen: set, route: Route) -> None:
         key = (route.path, route.method, route.file)
-        if any((item.path, item.method, item.file) == key for item in result.routes):
+        if key in seen:
             return
+        seen.add(key)
         result.routes.append(route)
 
     @staticmethod
@@ -594,11 +560,15 @@ def _controller_name(value: PhpValue | None, namespace: str | None, names: NameC
     return name
 
 
-def _registered_controllers(tokens: list[Token], names: NameContext) -> set[str]:
-    """Controller names from `'controllers' => ['invokables' | 'factories' | 'aliases' => [...]]`."""
-    found: set[str] = set()
+def _registered_controllers(tokens: list[Token], names: NameContext) -> tuple[set[str], set[str]]:
+    """Controller names from `'controllers' => [...]`: ``(registered, aliases)``.
+
+    Omeka adds only `invokables` and `factories` keys as ACL resources
+    (AclFactory::addResources); `aliases` are dispatchable but not resources."""
+    registered: set[str] = set()
+    aliases: set[str] = set()
     for controllers in keyed_arrays(tokens, "controllers"):
-        for kind in ("invokables", "factories", "aliases"):
+        for kind, bucket_set in (("invokables", registered), ("factories", registered), ("aliases", aliases)):
             bucket = controllers.get(kind)
             if not isinstance(bucket, PhpArray):
                 continue
@@ -606,7 +576,58 @@ def _registered_controllers(tokens: list[Token], names: NameContext) -> set[str]
                 if isinstance(key, PhpString):
                     name = key.value.strip().lstrip("\\")
                 else:
-                    name = class_name(key, names) or "" if key is not None else ""
+                    name = (class_name(key, names) or "") if key is not None else ""
                 if name:
-                    found.add(name)
-    return found
+                    bucket_set.add(name)
+    return registered, aliases
+
+
+class _Decider:
+    """Route → :class:`Decision`, with `:controller` candidate sets and
+    combined decisions memoised per namespace (and action)."""
+
+    def __init__(self, acl: Acl, controllers: set[str], omeka_app: bool) -> None:
+        self.acl = acl
+        self.controllers = controllers
+        self.omeka_app = omeka_app
+        self._candidates: dict[str, list[str]] = {}
+        self._combined: dict[tuple[str, str | None], Decision] = {}
+
+    def decide(self, found: LaminasRoute, names: NameContext) -> Decision:
+        acl_decision = self._decide_acl(found, names) if self.omeka_app else Decision("unknown")
+        if is_true(found.defaults.get("__ADMIN__")):
+            # Login first; the ACL's role check still applies after it.
+            if acl_decision.auth == "required":
+                return Decision(
+                    "required",
+                    ["omeka:admin_login", *acl_decision.guards],
+                    f"{_ADMIN_EVIDENCE}; {acl_decision.evidence}",
+                )
+            return Decision("required", ["omeka:admin_login"], _ADMIN_EVIDENCE)
+        return acl_decision
+
+    def _decide_acl(self, found: LaminasRoute, names: NameContext) -> Decision:
+        defaults = found.defaults
+        namespace = _string(defaults.get("__NAMESPACE__"))
+        action = None if ":action" in found.path else _string(defaults.get("action"))
+        if ":controller" in found.path:
+            if not namespace:
+                return Decision("unknown")
+            key = (namespace, action)
+            if key not in self._combined:
+                self._combined[key] = combine(
+                    [self.acl.decide(c, action) for c in self._namespace_controllers(namespace)], namespace
+                )
+            return self._combined[key]
+        controller = _controller_name(defaults.get("controller"), namespace, names)
+        if controller is None:
+            return Decision("unknown")
+        return self.acl.decide(controller, action)
+
+    def _namespace_controllers(self, namespace: str) -> list[str]:
+        if namespace not in self._candidates:
+            prefix = namespace + "\\"
+            self._candidates[namespace] = sorted(
+                c for c in self.controllers if c.startswith(prefix) and "\\" not in c[len(prefix) :]
+            )
+        return self._candidates[namespace]

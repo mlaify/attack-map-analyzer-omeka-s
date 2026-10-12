@@ -52,9 +52,17 @@ class Token:
     offset: int
 
 
-def tokenize(source: str, start: int = 0, max_tokens: int = MAX_TOKENS) -> list[Token]:
+class TokenList(list):
+    """Tokens, plus ``truncated``: True when ``max_tokens`` stopped the
+    tokenizer before the end of the source (``end_offset`` is where)."""
+
+    truncated: bool = False
+    end_offset: int = 0
+
+
+def tokenize(source: str, start: int = 0, max_tokens: int = MAX_TOKENS) -> TokenList:
     """Tokenize PHP source from ``start``. Unterminated strings/comments run to EOF."""
-    tokens: list[Token] = []
+    tokens = TokenList()
     n = len(source)
     i = start
     while i < n and len(tokens) < max_tokens:
@@ -133,6 +141,8 @@ def tokenize(source: str, start: int = 0, max_tokens: int = MAX_TOKENS) -> list[
             continue
         tokens.append(Token(OP, c, i))
         i += 1
+    tokens.truncated = i < n
+    tokens.end_offset = i
     return tokens
 
 
@@ -358,6 +368,25 @@ def keyed_arrays(tokens: list[Token], key: str) -> list[PhpArray]:
             continue
         i += 1
     return found
+
+
+def keyed_array_spans(tokens: list[Token], key: str) -> list[tuple[int, int]]:
+    """Source ``(start, end)`` offsets of every outermost array literal that is
+    the value of string key ``key``. An unterminated array runs to the last token."""
+    spans: list[tuple[int, int]] = []
+    parser = _Parser(tokens)
+    n = len(tokens)
+    i = 0
+    while i < n - 2:
+        tok = tokens[i]
+        if tok.kind == STR and tok.text == key and tokens[i + 1].kind == ARROW and tokens[i + 2].kind == OPEN:
+            _, end = parser.parse_array(i + 2)
+            last = tokens[min(end, n) - 1]
+            spans.append((tokens[i + 2].offset, last.offset + len(last.text)))
+            i = max(end, i + 1)
+            continue
+        i += 1
+    return spans
 
 
 # ---------------------------------------------------------------------------

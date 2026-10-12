@@ -4,26 +4,45 @@ Omeka decides who reaches a controller with its ACL (`Omeka\\Permissions\\Acl`,
 a Laminas ACL). Controllers are ACL resources, the action is the privilege,
 and `MvcListeners::authorizeUserAgainstController` checks
 `userIsAllowed($controller, $action)` on every dispatch. The anonymous visitor
-has no role, so a rule for the `null` role ("all roles") reaches them.
+has no role, so only rules for the `null` role ("all roles") reach them.
 
 This module reads `$acl->allow(<roles>, <resources>, <privileges>[, <assertion>])`
 and `->deny(...)` calls from a module's `Module.php` (`onBootstrap`,
 `attachListeners` or helpers they call) and from `*AclFactory.php` (Omeka core's
-rules), and answers, per controller and action:
+rules), and answers per controller and action with Laminas' lookup order
+(`Laminas\\Permissions\\Acl\\Acl::isAllowed`):
 
-- **anonymous**: an unconditional allow for `null` (or `'guest'`, the Guest
-  module's self-registration role, treated as public) covers the controller
-  and action.
-- **required**: an anonymous deny covers it, or no anonymous rule covers it at
-  all. Omeka denies by default, so a controller only some roles are allowed
-  (or no rule names) needs a login. This is only concluded when every
-  anonymous rule in the repo was resolved: an `allow(null, $controllers)`
-  with a variable resource makes every unmatched controller unknown.
-- **unknown**: a conditional rule (an assertion argument), a privilege list
-  that doesn't settle the action, or an unresolved role.
+1. For each resource level, the specific controller first and then the
+   all-resources level (`null`; Omeka's controllers have no parent resources):
+   the role's own rules (the privilege, then all privileges), then the
+   all-roles rules (the privilege, then all privileges). An all-roles,
+   all-privileges *deny* on the specific controller doesn't stop the lookup;
+   it continues to the all-resources level, as in Laminas.
+2. For each (resource, role, privilege) slot the last rule written wins.
+3. No rule: denied (Omeka's default).
 
-Zero-argument `allow()` (Omeka grants everything during installation) is
-ignored.
+Two public principals are checked: the anonymous visitor (all-roles rules
+only) and `'guest'` (the Guest module's self-registration role, its own rules
+then all-roles rules; treated as public). Role inheritance isn't modelled:
+Omeka core and the Guest module add their roles without parents.
+
+- **anonymous**: either principal is allowed.
+- **required**: both are denied (by a rule or by default). Guards name the
+  roles that are allowed (`omeka_acl:requires_role(<role>)`) or
+  `omeka_acl:default_deny`.
+- **unknown**: a conditional rule (an assertion) decides, a `:action` route's
+  actions disagree, or a rule's role or resource couldn't be resolved (an
+  unresolved anonymous resource, or a zero-argument `allow()` outside
+  `*AclFactory.php`, turns every deny into unknown).
+
+Zero-argument `allow()` in `*AclFactory.php` is Omeka's grant-all while it is
+not installed or needs a migration. The installer and migration controllers
+(``INSTALL_CONTROLLERS``) serve exactly then, so they are never reported as
+`required` (`unknown` with a note instead).
+
+Decisions are memoised per (controller, action), rules are indexed by
+(principal, resource, privilege), and an ``Acl`` makes at most
+``MAX_DECISIONS`` fresh decisions; past that budget it answers `unknown`.
 """
 
 from __future__ import annotations
@@ -48,6 +67,12 @@ from .phparray import (
 ANONYMOUS_ROLES = frozenset({"guest"})
 ALL = "*"
 MAX_RULES_PER_FILE = 2_000
+MAX_DECISIONS = 50_000
+MAX_PRIVILEGES_PER_DECISION = 256
+_OTHER_ACTION = "\0any-other-action"
+# Controllers that run while Omeka isn't installed or needs a migration, when
+# AclFactory grants everything (`$acl->allow()`) and MvcListeners redirects there.
+INSTALL_CONTROLLERS = frozenset({"Omeka\\Controller\\Install", "Omeka\\Controller\\Migrate"})
 
 
 @dataclass
@@ -55,25 +80,28 @@ class AclRule:
     allow: bool
     file: str
     line: int
-    # A rule for the anonymous visitor: role `null` or `'guest'`.
-    anonymous: bool
-    # The role couldn't be resolved (a variable): it might be anonymous.
-    role_unresolved: bool
+    # Role names as written; `null` for the all-roles role. `Acl::ROLE_*`
+    # constants are resolved to their values (`Acl::ROLE_GUEST` → `guest`).
     roles: list[str]
-    # Resolved resource names; `ALL` for a `null`/missing resource argument.
+    # The role argument couldn't be resolved (a variable): it might be anonymous.
+    role_unresolved: bool
+    # Resolved resource names; `ALL` for a `null` resource argument.
     resources: list[str]
     resources_unresolved: bool
     # None = every privilege (action).
     privileges: list[str] | None
     privileges_unresolved: bool
     conditional: bool
+    # `$acl->allow()` with no arguments (grant-all).
+    grant_all: bool = False
+
+    @property
+    def anonymous(self) -> bool:
+        return any(role == "null" or role.lower() in ANONYMOUS_ROLES for role in self.roles)
 
     @property
     def maybe_anonymous(self) -> bool:
         return self.anonymous or self.role_unresolved
-
-    def covers(self, resource: str) -> bool:
-        return ALL in self.resources or resource in self.resources
 
 
 @dataclass
@@ -83,28 +111,26 @@ class Decision:
     evidence: str | None = None
 
 
-def _role_names(value: PhpValue | None) -> tuple[bool, bool, list[str]]:
-    """(anonymous, unresolved, named roles) of a role argument."""
+def _role_names(value: PhpValue | None) -> tuple[bool, list[str]]:
+    """(unresolved, role names) of a role argument; `null` is the all-roles role."""
     if value is None:
-        return True, False, ["null"]  # no role argument: all roles
+        return False, ["null"]
     values = [v for _, v in value.items] if isinstance(value, PhpArray) else [value]
-    anonymous = unresolved = False
+    unresolved = False
     roles: list[str] = []
     for item in values:
-        if isinstance(item, PhpExpr) and item.text.strip().lower() == "null":
-            anonymous = True
+        text = item.text.strip() if isinstance(item, PhpExpr) else ""
+        if isinstance(item, PhpExpr) and text.lower() == "null":
             roles.append("null")
         elif isinstance(item, PhpString):
-            name = item.value.strip()
-            if name.lower() in ANONYMOUS_ROLES:
-                anonymous = True
-            roles.append(name)
-        elif isinstance(item, PhpExpr) and "::ROLE_" in item.text and " " not in item.text.strip():
-            # `Acl::ROLE_EDITOR` → `editor`
-            roles.append(item.text.strip().rsplit("::ROLE_", 1)[1].lower())
+            roles.append(item.value.strip())
+        elif isinstance(item, PhpExpr) and "::ROLE_" in text and " " not in text:
+            # `Acl::ROLE_SITE_ADMIN` → `site_admin`, `Acl::ROLE_GUEST` → `guest`:
+            # Omeka's constants are the lower-cased suffix.
+            roles.append(text.rsplit("::ROLE_", 1)[1].lower())
         else:
             unresolved = True
-    return anonymous, unresolved, roles
+    return unresolved, roles
 
 
 def _resource_names(value: PhpValue | None, names: NameContext) -> tuple[list[str], bool]:
@@ -134,9 +160,8 @@ def _privileges(value: PhpValue | None) -> tuple[list[str] | None, bool]:
 
 
 def acl_rules(tokens: list[Token], names: NameContext, file: str, line_of: Callable[[int], int]) -> list[AclRule]:
-    """Every `->allow(...)` / `->deny(...)` call with at least one argument.
-
-    ``line_of`` maps a source offset to its 1-based line."""
+    """Every `->allow(...)` / `->deny(...)` call. ``line_of`` maps a source
+    offset to its 1-based line."""
     rules: list[AclRule] = []
     n = len(tokens)
     i = 0
@@ -157,8 +182,23 @@ def acl_rules(tokens: list[Token], names: NameContext, file: str, line_of: Calla
         args, end = parse_call_args(tokens, i + 3)
         i = max(end, i + 4)
         if not args:
-            continue  # `$acl->allow()`: Omeka's installation-time grant-all
-        anonymous, role_unresolved, roles = _role_names(args[0])
+            rules.append(
+                AclRule(
+                    allow=verb == "allow",
+                    file=file,
+                    line=line_of(offset),
+                    roles=["null"],
+                    role_unresolved=False,
+                    resources=[ALL],
+                    resources_unresolved=False,
+                    privileges=None,
+                    privileges_unresolved=False,
+                    conditional=False,
+                    grant_all=True,
+                )
+            )
+            continue
+        role_unresolved, roles = _role_names(args[0])
         resources, resources_unresolved = _resource_names(args[1] if len(args) > 1 else None, names)
         privileges, privileges_unresolved = _privileges(args[2] if len(args) > 2 else None)
         conditional = len(args) > 3 and not (isinstance(args[3], PhpExpr) and args[3].text.strip().lower() == "null")
@@ -167,9 +207,8 @@ def acl_rules(tokens: list[Token], names: NameContext, file: str, line_of: Calla
                 allow=verb == "allow",
                 file=file,
                 line=line_of(offset),
-                anonymous=anonymous,
-                role_unresolved=role_unresolved,
                 roles=roles,
+                role_unresolved=role_unresolved,
                 resources=resources,
                 resources_unresolved=resources_unresolved,
                 privileges=privileges,
@@ -181,11 +220,15 @@ def acl_rules(tokens: list[Token], names: NameContext, file: str, line_of: Calla
 
 
 def _describe(rule: AclRule, resource: str) -> str:
+    """The rule as written, narrowed to the resource that matched."""
     roles = [role if role == "null" else f"'{role}'" for role in rule.roles]
     if rule.role_unresolved:
         roles.append("<unresolved>")
     role = roles[0] if len(roles) == 1 else "[" + ", ".join(roles) + "]"
-    args = [role, f"'{resource}'"]
+    shown = "null" if resource == ALL else f"'{resource}'"
+    if len(rule.resources) > 1:
+        shown += f" (1 of {len(rule.resources)} resources)"
+    args = [role, shown]
     if rule.privileges is not None:
         args.append("[" + ", ".join(f"'{p}'" for p in rule.privileges) + "]")
     if rule.conditional:
@@ -194,74 +237,170 @@ def _describe(rule: AclRule, resource: str) -> str:
     return f"$acl->{verb}({', '.join(args)}) at {rule.file}:{rule.line}"
 
 
-class Acl:
-    """The repo's ACL rules, in source order (a later rule overrides an
-    earlier one, as in Laminas ACL)."""
+# A lookup result: True/False (allowed/denied by a rule), None (a conditional
+# rule decides: unknown), or "default" (no rule: Omeka's default deny).
+_Slot = tuple[str, str | None]  # (resource, privilege or None for all privileges)
 
-    def __init__(self, rules: list[AclRule]) -> None:
+
+class Acl:
+    """The repo's ACL rules, indexed by principal and (resource, privilege)."""
+
+    def __init__(
+        self,
+        rules: list[AclRule],
+        registered: set[str] | None = None,
+        aliases: set[str] | None = None,
+    ) -> None:
         self.rules = rules
-        # An anonymous (or unresolved-role) rule whose resources we couldn't
-        # resolve might cover any controller: never conclude default-deny.
-        self.blocked = any(r.maybe_anonymous and r.resources_unresolved for r in rules)
+        # None: registrations unknown (unit use); otherwise the ACL resources
+        # Omeka adds (controllers.invokables / factories keys).
+        self.registered = registered
+        self.aliases = aliases or set()
+        # Something we couldn't resolve might allow the visitor anything.
+        self.blocked = any(
+            (r.maybe_anonymous and r.resources_unresolved)
+            or (r.grant_all and not r.file.endswith("AclFactory.php"))
+            for r in rules
+        )
+        self.all_roles: dict[_Slot, AclRule] = {}
+        self.guest: dict[_Slot, AclRule] = {}
+        self.unresolved_role_resources: set[str] = set()
+        self.privileges_by_resource: dict[str, set[str]] = {}
+        self.allowed_roles: dict[str, set[str]] = {}
+        self.unresolved_privileges: set[str] = set()
+        for rule in rules:
+            if rule.grant_all:
+                continue  # install-time grant (AclFactory) or a blocker (above)
+            for resource in rule.resources:
+                if rule.privileges_unresolved:
+                    self.unresolved_privileges.add(resource)
+                if rule.role_unresolved:
+                    self.unresolved_role_resources.add(resource)
+                slots: list[_Slot] = [(resource, p) for p in rule.privileges] if rule.privileges is not None else []
+                if rule.privileges is None:
+                    slots = [(resource, None)]
+                for role in rule.roles:
+                    table = self.all_roles if role == "null" else self.guest if role.lower() in ANONYMOUS_ROLES else None
+                    if table is not None:
+                        for slot in slots:
+                            table[slot] = rule  # last rule written wins
+                    elif rule.allow:
+                        self.allowed_roles.setdefault(resource, set()).add(role)
+                if rule.privileges:
+                    self.privileges_by_resource.setdefault(resource, set()).update(rule.privileges)
+        self._memo: dict[tuple[str, str | None], Decision] = {}
+        self.fresh_decisions = 0
+
+    # -- Laminas lookup -------------------------------------------------
+
+    def _lookup(self, tables: list[tuple[str, dict[_Slot, AclRule]]], resource: str, privilege: str):
+        """(result, rule, resource level) for one principal; see the module docstring."""
+        for level in (resource, ALL) if resource != ALL else (ALL,):
+            for kind, table in tables:
+                rule = table.get((level, privilege))
+                if rule is not None:
+                    return (None if rule.conditional else rule.allow), rule, level
+                rule = table.get((level, None))
+                if rule is not None:
+                    if rule.conditional:
+                        return None, rule, level
+                    if kind == "role" or rule.allow or level == ALL:
+                        return rule.allow, rule, level
+                    # All-roles, all-privileges deny on the specific
+                    # resource: Laminas continues to the parent level.
+        return "default", None, None
+
+    def _public(self, resource: str, privilege: str):
+        """Is the visitor or a guest allowed? Returns (result, rule, level)."""
+        visitor = self._lookup([("all", self.all_roles)], resource, privilege)
+        if visitor[0] is True:
+            return visitor
+        guest = self._lookup([("role", self.guest), ("all", self.all_roles)], resource, privilege)
+        if guest[0] is True:
+            return guest
+        if visitor[0] is None or guest[0] is None:
+            return None, visitor[1] or guest[1], visitor[2] or guest[2]
+        # Both denied: report the visitor's reason.
+        return visitor
+
+    # -- decisions --------------------------------------------------------
 
     def decide(self, controller: str, action: str | None) -> Decision:
         """Access to ``controller``/``action`` (None = any action, from `:action`)."""
-        anon = [r for r in self.rules if r.maybe_anonymous and r.covers(controller)]
-        if anon:
-            return self._decide_anonymous(anon, controller, action)
+        key = (controller, action)
+        cached = self._memo.get(key)
+        if cached is not None:
+            return cached
+        if self.fresh_decisions >= MAX_DECISIONS:
+            return Decision("unknown")  # per-repo budget spent
+        self.fresh_decisions += 1
+        decision = self._decide(controller, action)
+        if decision.auth == "required" and controller in INSTALL_CONTROLLERS:
+            decision = Decision(
+                "unknown",
+                [],
+                f"{controller} serves while Omeka isn't installed or needs a migration, when AclFactory grants "
+                "every role everything ($acl->allow()) and MvcListeners redirects there; after that: "
+                + (decision.evidence or ""),
+            )
+        self._memo[key] = decision
+        return decision
+
+    def _decide(self, controller: str, action: str | None) -> Decision:
+        if self.registered is not None and controller not in self.registered:
+            if controller in self.aliases:
+                return Decision(
+                    "anonymous",
+                    [],
+                    f"'{controller}' is a controller alias, not an ACL resource (Omeka adds only "
+                    "controllers.invokables/factories keys), and authorizeUserAgainstController allows a "
+                    "controller that isn't a resource",
+                )
+            return Decision("unknown")  # registered somewhere we didn't see, or not at all
+        if controller in self.unresolved_role_resources or ALL in self.unresolved_role_resources:
+            return Decision("unknown")
+        if action is not None:
+            result, rule, level = self._public(controller, action)
+            return self._from_result(controller, result, rule, level, action)
+        privileges = self.privileges_by_resource.get(controller, set()) | self.privileges_by_resource.get(ALL, set())
+        if (
+            len(privileges) > MAX_PRIVILEGES_PER_DECISION
+            or controller in self.unresolved_privileges
+            or ALL in self.unresolved_privileges
+        ):
+            return Decision("unknown")
+        outcomes = [self._public(controller, p) for p in sorted(privileges)]
+        other = self._public(controller, _OTHER_ACTION)
+        results = {o[0] for o in outcomes} | {other[0]}
+        if results == {True}:
+            return self._from_result(controller, True, other[1], other[2], None)
+        if results <= {False, "default"}:
+            return self._from_result(controller, other[0], other[1], other[2], None)
+        return Decision("unknown")  # some actions public, some not, or conditional
+
+    def _from_result(self, controller: str, result, rule: AclRule | None, level: str | None, action: str | None):
+        if result is True and rule is not None and level is not None:
+            return Decision("anonymous", [], _describe(rule, level))
+        if result is None:
+            return Decision("unknown")
         if self.blocked:
             return Decision("unknown")
-        roles = sorted(
-            {
-                role
-                for r in self.rules
-                if r.allow and not r.maybe_anonymous and r.covers(controller)
-                for role in r.roles
-            }
-        )
+        roles = sorted(self.allowed_roles.get(controller, set()) | self.allowed_roles.get(ALL, set()))
+        if result is False and rule is not None and level is not None:
+            guards = ["omeka_acl:deny_anonymous", *(f"omeka_acl:requires_role({r})" for r in roles)]
+            return Decision("required", guards, _describe(rule, level))
         guards = [f"omeka_acl:requires_role({role})" for role in roles] or ["omeka_acl:default_deny"]
         if roles:
             basis = f"requires_role: {', '.join(roles)}"
         else:
             basis = "requires_role: only roles allowed every resource, site_admin and global_admin in stock Omeka"
+        what = f"{controller} action '{action}'" if action is not None else controller
         return Decision(
             "required",
             guards,
-            f"Omeka ACL: no rule for the anonymous role covers {controller}; Omeka denies by default and checks "
+            f"Omeka ACL: no rule allows the anonymous role {what}; Omeka denies by default and checks "
             f"the role on every dispatch ({basis})",
         )
-
-    @staticmethod
-    def _decide_anonymous(anon: list[AclRule], controller: str, action: str | None) -> Decision:
-        if action is not None:
-            specific = [r for r in anon if r.privileges is not None and action in r.privileges]
-            general = [r for r in anon if r.privileges is None]
-            # Laminas: a privilege-specific rule beats an all-privileges one;
-            # among equals the last rule wins.
-            deciding = specific[-1] if specific else (general[-1] if general else None)
-            if deciding is None:
-                if any(r.privileges_unresolved for r in anon):
-                    return Decision("unknown")
-                # Only rules for other actions: this action falls through to
-                # Omeka's default deny.
-                return Decision(
-                    "required",
-                    ["omeka_acl:default_deny"],
-                    f"Omeka ACL: anonymous rules for {controller} don't include action '{action}'; "
-                    "Omeka denies by default",
-                )
-        else:
-            # Any action (`:action` in the path): only an all-privileges rule
-            # with no anonymous privilege-specific deny settles it.
-            general = [r for r in anon if r.privileges is None]
-            if not general or any(not r.allow and r.privileges is not None for r in anon):
-                return Decision("unknown")
-            deciding = general[-1]
-        if deciding.role_unresolved and not deciding.anonymous or deciding.conditional:
-            return Decision("unknown")
-        if deciding.allow:
-            return Decision("anonymous", [], _describe(deciding, controller))
-        return Decision("required", ["omeka_acl:deny_anonymous"], _describe(deciding, controller))
 
 
 def combine(decisions: list[Decision], namespace: str) -> Decision:
