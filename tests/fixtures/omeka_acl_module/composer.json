@@ -1,0 +1,5 @@
+{
+  "name": "acme/omeka-s-module-gallery",
+  "type": "omeka-s-module",
+  "require-dev": { "omeka/omeka-s": "^4.0" }
+}
