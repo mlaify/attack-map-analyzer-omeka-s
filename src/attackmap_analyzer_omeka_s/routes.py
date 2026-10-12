@@ -25,12 +25,16 @@ reachable path:
   parent is itself reachable only if it has no children or sets
   `'may_terminate' => true`.
 - **Method routes** (`Method::class`, `'verb' => 'post'`, comma lists) put
-  their HTTP method(s) on the parent's path instead of adding a path.
+  their HTTP method(s) on every form of the parent's path instead of adding
+  a path.
 - **Segment optional parts** (`[/:action[/:id]]`) are expanded progressively:
   the minimal form, then one more optional group opened at a time in source
   order (`/users`, `/users/:id`). That is at most ``MAX_FORMS`` paths per route,
   so `/:controller[/:action[/:id]]` yields 3 paths, not every combination.
-  Children join onto their parent's minimal form. `:param{delims}` and
+  A child path joins its parent's *maximal* form, because Laminas' parent
+  part consumes greedily (`/h[/:action]` + `/x` is `/h/:action/x`), unless
+  the child can match nothing (`[/:id]`), which keeps every parent form.
+  Method children cover every parent form. `:param{delims}` and
   translated `{literal}` parts are reduced to `:param` and `literal`.
 - `Hostname`/`Scheme` routes contribute no path; `Regex` routes use their
   `spec` (`/install`, with `%param%` as `:param`). Part, Wildcard, Query and
@@ -161,6 +165,30 @@ def expand_optional(template: str, max_forms: int = MAX_FORMS) -> list[str]:
     return forms
 
 
+def maximal_form(template: str) -> str:
+    """``template`` with every optional group filled in."""
+    if "[" not in template:
+        return template
+    tree = _parse_optional(template)
+    order: list[int] = []
+    _groups_preorder(tree, order)
+    return _render(tree, set(order))
+
+
+def join_child(parent_template: str, piece: str) -> str:
+    """The template a child route's ``piece`` makes under its parent.
+
+    Laminas' `Part::match` lets the parent consume greedily and never backs
+    off, so a child is reached only after the parent's optional parts are
+    filled: `/h[/:action]` + `/x` is `/h/:action/x` (`/h/x` sets action=x and
+    the child never matches). A child that can itself match nothing
+    (`[/:id]`) also leaves every parent form reachable, so it extends the
+    parent template as is: `/h[/:action][/:id]`."""
+    if minimal_form(piece) == "":
+        return parent_template + piece
+    return maximal_form(parent_template) + piece
+
+
 def minimal_form(template: str) -> str:
     """``template`` with every optional group left out."""
     return _render(_parse_optional(template), set()) if "[" in template else template
@@ -203,9 +231,9 @@ def route_type(value: PhpValue | None) -> str | None:
 
 @dataclass
 class RouteNode:
-    """What a named route passes to its children: the minimal path child
-    routes join onto, the merged defaults, an inherited Method verb, and the
-    full template (optional parts included) that Method children expand."""
+    """What a named route passes to its children: its template (optional
+    parts included; see :func:`join_child`), the merged defaults and an
+    inherited Method verb. ``template`` None means ``prefix``."""
 
     prefix: str
     defaults: dict[str, PhpValue] = field(default_factory=dict)
@@ -331,7 +359,7 @@ def router_routes(
     out: list[LaminasRoute] = []
     ctx = _WalkContext(out, known or {}, index, consumed)
     for routes in trees:
-        _walk(routes, "", "", "", {}, None, 0, ctx)
+        _walk(routes, "", "", {}, None, 0, ctx)
     return out
 
 
@@ -373,7 +401,6 @@ def _looks_like_route_spec(value: PhpValue) -> bool:
 
 def _walk(
     routes: PhpArray,
-    prefix: str,
     parent_template: str,
     prefix_name: str,
     defaults: dict[str, PhpValue],
@@ -381,8 +408,8 @@ def _walk(
     depth: int,
     ctx: _WalkContext,
 ) -> None:
-    """``prefix`` is the parent's minimal path (child routes join onto it);
-    ``parent_template`` keeps its optional parts, for Method children."""
+    """``parent_template`` keeps the parent's optional parts: child paths
+    join it with :func:`join_child`, Method children expand all its forms."""
     if depth > MAX_ROUTE_DEPTH:
         return
     out = ctx.out
@@ -409,7 +436,7 @@ def _walk(
             if isinstance(own_defaults, PhpArray):
                 merged.update(own_defaults.entries())
             base_template = base.template if base.template is not None else base.prefix
-            _walk(children, base.prefix, base_template, full_name, merged, base.method, depth + 1, ctx)
+            _walk(children, base_template, full_name, merged, base.method, depth + 1, ctx)
             continue
 
         merged = dict(defaults)
@@ -435,13 +462,13 @@ def _walk(
             literal = options.get("spec")
             if not isinstance(literal, PhpString) or not literal.value.startswith("/"):
                 continue
-            template = prefix + _REGEX_SPEC_PARAM.sub(r":\1", literal.value)
+            template = join_child(parent_template, _REGEX_SPEC_PARAM.sub(r":\1", literal.value))
             offset = literal.offset
         elif kind in _PATH_KINDS:
             literal = options.get("route")
             if not isinstance(literal, PhpString) or not literal.value.startswith(("/", "[")):
                 continue
-            template = prefix + _segment_text(literal.value)
+            template = join_child(parent_template, _segment_text(literal.value))
             offset = literal.offset
         else:
             continue  # Part, Wildcard, Query, console `simple`, custom types
@@ -455,9 +482,9 @@ def _walk(
                     out.append(LaminasRoute(path, verb, offset, full_name, template, merged))
         child_method = methods[0] if kind == "method" and methods and len(methods) == 1 else method
         if ctx.index is not None:
-            ctx.index.setdefault(full_name, RouteNode(minimal_form(template), merged, child_method, template))
+            ctx.index.setdefault(full_name, RouteNode(maximal_form(template), merged, child_method, template))
         if isinstance(children, PhpArray):
-            _walk(children, minimal_form(template), template, full_name, merged, child_method, depth + 1, ctx)
+            _walk(children, template, full_name, merged, child_method, depth + 1, ctx)
 
 
 def fallback_route_literals(
@@ -586,6 +613,8 @@ def _route_methods(value: PhpValue | None) -> list[str]:
 __all__ = [
     "LaminasRoute",
     "fallback_route_literals",
+    "join_child",
+    "maximal_form",
     "MezzioRoute",
     "RouteNode",
     "route_trees",

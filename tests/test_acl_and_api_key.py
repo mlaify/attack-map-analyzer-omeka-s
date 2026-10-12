@@ -416,17 +416,50 @@ def _acl(source: str, registered: set[str] | None = None, aliases: set[str] | No
     return Acl(acl_rules(tokenize(source), NameContext(), "Module.php", lambda offset: 1), registered, aliases)
 
 
-def test_specific_resource_rule_beats_an_all_resources_rule() -> None:
-    acl = _acl("<?php $acl->allow(null, 'A\\Controller\\Pub'); $acl->deny(null, null, ['delete']);")
-    # Laminas checks the specific resource first: its all-privileges allow
-    # settles `delete` before the all-resources deny is consulted.
+def test_specific_resource_rule_beats_an_earlier_all_resources_rule() -> None:
+    acl = _acl("<?php $acl->deny(null, null); $acl->allow(null, 'A\\\\Controller\\\\Pub');")
+    # Laminas checks the specific resource first, and this allow was written
+    # after the null-resource deny.
     decision = acl.decide("A\\Controller\\Pub", "delete")
     assert decision.auth == "anonymous"
     assert decision.evidence == "$acl->allow(null, 'A\\Controller\\Pub') at Module.php:1"
-    # Another controller falls through to the all-resources deny.
     other = acl.decide("A\\Controller\\Other", "delete")
     assert (other.auth, other.guards[0]) == ("required", "omeka_acl:deny_anonymous")
-    assert other.evidence == "$acl->deny(null, null, ['delete']) at Module.php:1"
+    assert other.evidence == "$acl->deny(null, null) at Module.php:1"
+
+
+def test_null_resource_rule_overwrites_registered_resources_in_program_order() -> None:
+    # Laminas setRule applies a null-resource rule to every resource
+    # registered so far (Omeka registers controllers before its rules), so a
+    # later null-resource rule overwrites the specific slots.
+    acl = _acl("<?php $acl->deny(null, 'X', 'show'); $acl->allow(null, null, 'show');")
+    assert acl.decide("X", "show").auth == "anonymous"
+    acl = _acl("<?php $acl->deny('guest', 'X'); $acl->allow('guest');")
+    assert acl.decide("X", "index").auth == "anonymous"
+    acl = _acl("<?php $acl->allow(null, 'Pub'); $acl->deny(null, null, ['delete']);")
+    assert acl.decide("Pub", "delete").auth == "required"
+    assert acl.decide("Pub", "show").auth == "anonymous"
+    acl = _acl("<?php $acl->allow(null, 'Pub'); $acl->deny(null, null);")
+    assert acl.decide("Pub", "show").auth == "required"
+
+
+def test_unreadable_privileges_make_fixed_actions_unknown_too() -> None:
+    for privileges in ("$actions", "Privileges::READ", "['show', $more]"):
+        acl = _acl(f"<?php $acl->allow(null, 'X', {privileges});")
+        assert acl.decide("X", "index").auth == "unknown", privileges
+        assert acl.decide("X", None).auth == "unknown", privileges
+
+
+def test_huge_resource_by_privilege_rule_is_indexed_linearly() -> None:
+    resources = ", ".join(f"'R{i}'" for i in range(6000))
+    privileges = ", ".join(f"'p{i}'" for i in range(6000))
+    start = time.perf_counter()
+    acl = _acl(f"<?php $acl->allow(null, [{resources}], [{privileges}]);")
+    assert acl.decide("R5", "p5999").auth == "anonymous"
+    assert acl.decide("R5", "other").auth == "required"
+    # `:action`: more privileges than the per-decision cap → unknown.
+    assert acl.decide("R5", None).auth == "unknown"
+    assert time.perf_counter() - start < 3.0
 
 
 def test_all_roles_deny_on_a_resource_continues_to_all_resources() -> None:

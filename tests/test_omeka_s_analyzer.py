@@ -155,9 +155,14 @@ def test_navigation_route_names_are_not_routes() -> None:
     # Omeka admin navigation `'route' => 'admin/harvester'` names a route;
     # only the router's path specs are routes.
     # The module's `'admin' => ['child_routes' => ...]` stub joins Omeka
-    # core's `/admin`, and the `[/:id]` child joins `/harvester` (#2).
+    # core's `/admin`; the `[/:id]` child can match nothing, so every form of
+    # `/harvester[/:action]` stays reachable before it (#2).
     result = OmekaSAnalyzer().analyze(NOISE)
-    assert {(r.path, r.method) for r in result.routes} == {("/admin/harvester", "ANY"), ("/admin/harvester/:id", "ANY")}
+    assert {(r.path, r.method) for r in result.routes} == {
+        ("/admin/harvester", "ANY"),
+        ("/admin/harvester/:action", "ANY"),
+        ("/admin/harvester/:action/:id", "ANY"),
+    }
 
 
 def test_db_and_api_connection_settings_are_not_secrets() -> None:

@@ -239,7 +239,6 @@ def _describe(rule: AclRule, resource: str) -> str:
 
 # A lookup result: True/False (allowed/denied by a rule), None (a conditional
 # rule decides: unknown), or "default" (no rule: Omeka's default deny).
-_Slot = tuple[str, str | None]  # (resource, privilege or None for all privileges)
 
 
 class Acl:
@@ -262,45 +261,82 @@ class Acl:
             or (r.grant_all and not r.file.endswith("AclFactory.php"))
             for r in rules
         )
-        self.all_roles: dict[_Slot, AclRule] = {}
-        self.guest: dict[_Slot, AclRule] = {}
+        # Per principal: resource → the rules naming it, in program order
+        # (each rule once per resource it names, never expanded per
+        # privilege), so the index stays linear in the source.
+        self.all_roles: dict[str, list[tuple[int, AclRule]]] = {}
+        self.guest: dict[str, list[tuple[int, AclRule]]] = {}
         self.unresolved_role_resources: set[str] = set()
-        self.privileges_by_resource: dict[str, set[str]] = {}
         self.allowed_roles: dict[str, set[str]] = {}
         self.unresolved_privileges: set[str] = set()
-        for rule in rules:
+        self._privilege_sets: dict[int, frozenset[str]] = {}
+        for seq, rule in enumerate(rules):
             if rule.grant_all:
                 continue  # install-time grant (AclFactory) or a blocker (above)
+            if rule.privileges is not None:
+                self._privilege_sets[id(rule)] = frozenset(rule.privileges)
+            tables = []
+            for role in rule.roles:
+                if role == "null":
+                    tables.append(self.all_roles)
+                elif role.lower() in ANONYMOUS_ROLES:
+                    tables.append(self.guest)
             for resource in rule.resources:
                 if rule.privileges_unresolved:
                     self.unresolved_privileges.add(resource)
                 if rule.role_unresolved:
                     self.unresolved_role_resources.add(resource)
-                slots: list[_Slot] = [(resource, p) for p in rule.privileges] if rule.privileges is not None else []
-                if rule.privileges is None:
-                    slots = [(resource, None)]
-                for role in rule.roles:
-                    table = self.all_roles if role == "null" else self.guest if role.lower() in ANONYMOUS_ROLES else None
-                    if table is not None:
-                        for slot in slots:
-                            table[slot] = rule  # last rule written wins
-                    elif rule.allow:
-                        self.allowed_roles.setdefault(resource, set()).add(role)
-                if rule.privileges:
-                    self.privileges_by_resource.setdefault(resource, set()).update(rule.privileges)
+                for table in tables:
+                    table.setdefault(resource, []).append((seq, rule))
+                if rule.allow:
+                    for role in rule.roles:
+                        if role != "null" and role.lower() not in ANONYMOUS_ROLES:
+                            self.allowed_roles.setdefault(resource, set()).add(role)
+        self._slot_memo: dict[tuple[int, str, str | None], tuple[int, AclRule] | None] = {}
         self._memo: dict[tuple[str, str | None], Decision] = {}
         self.fresh_decisions = 0
 
     # -- Laminas lookup -------------------------------------------------
 
-    def _lookup(self, tables: list[tuple[str, dict[_Slot, AclRule]]], resource: str, privilege: str):
+    def _written(self, table: dict[str, list[tuple[int, AclRule]]], resource: str, privilege: str | None):
+        """The last rule written to the (resource, privilege) slot directly:
+        ``(seq, rule)`` or None. ``privilege`` None is the all-privileges slot."""
+        key = (id(table), resource, privilege)
+        if key in self._slot_memo:
+            return self._slot_memo[key]
+        found = None
+        for seq, rule in reversed(table.get(resource, ())):
+            if privilege is None:
+                if rule.privileges is None:
+                    found = (seq, rule)
+                    break
+            elif rule.privileges is not None and privilege in self._privilege_sets[id(rule)]:
+                found = (seq, rule)
+                break
+        self._slot_memo[key] = found
+        return found
+
+    def _slot(self, table: dict[str, list[tuple[int, AclRule]]], level: str, privilege: str | None):
+        """The rule in a slot. Laminas' setRule applies a `null`-resource rule
+        to every resource registered so far, overwriting their slots; Omeka
+        registers every controller before adding rules, so at a specific
+        level the later of the specific rule and the `null`-resource rule wins."""
+        own = self._written(table, level, privilege)
+        if level == ALL:
+            return own[1] if own else None
+        spread = self._written(table, ALL, privilege)
+        if own is None or (spread is not None and spread[0] > own[0]):
+            return spread[1] if spread else None
+        return own[1]
+
+    def _lookup(self, tables: list[tuple[str, dict[str, list[tuple[int, AclRule]]]]], resource: str, privilege: str):
         """(result, rule, resource level) for one principal; see the module docstring."""
         for level in (resource, ALL) if resource != ALL else (ALL,):
             for kind, table in tables:
-                rule = table.get((level, privilege))
+                rule = self._slot(table, level, privilege)
                 if rule is not None:
                     return (None if rule.conditional else rule.allow), rule, level
-                rule = table.get((level, None))
+                rule = self._slot(table, level, None)
                 if rule is not None:
                     if rule.conditional:
                         return None, rule, level
@@ -309,6 +345,19 @@ class Acl:
                     # All-roles, all-privileges deny on the specific
                     # resource: Laminas continues to the parent level.
         return "default", None, None
+
+    def _privileges_for(self, resource: str) -> set[str] | None:
+        """Privileges public rules name for ``resource`` or all resources;
+        None past ``MAX_PRIVILEGES_PER_DECISION``."""
+        found: set[str] = set()
+        for table in (self.all_roles, self.guest):
+            for level in (resource, ALL):
+                for _seq, rule in table.get(level, ()):
+                    if rule.privileges is not None:
+                        found.update(rule.privileges)
+                        if len(found) > MAX_PRIVILEGES_PER_DECISION:
+                            return None
+        return found
 
     def _public(self, resource: str, privilege: str):
         """Is the visitor or a guest allowed? Returns (result, rule, level)."""
@@ -359,15 +408,15 @@ class Acl:
             return Decision("unknown")  # registered somewhere we didn't see, or not at all
         if controller in self.unresolved_role_resources or ALL in self.unresolved_role_resources:
             return Decision("unknown")
+        # A privilege list we couldn't read (a variable or constant) might
+        # name any action, fixed or not.
+        if controller in self.unresolved_privileges or ALL in self.unresolved_privileges:
+            return Decision("unknown")
         if action is not None:
             result, rule, level = self._public(controller, action)
             return self._from_result(controller, result, rule, level, action)
-        privileges = self.privileges_by_resource.get(controller, set()) | self.privileges_by_resource.get(ALL, set())
-        if (
-            len(privileges) > MAX_PRIVILEGES_PER_DECISION
-            or controller in self.unresolved_privileges
-            or ALL in self.unresolved_privileges
-        ):
+        privileges = self._privileges_for(controller)
+        if privileges is None:
             return Decision("unknown")
         outcomes = [self._public(controller, p) for p in sorted(privileges)]
         other = self._public(controller, _OTHER_ACTION)
