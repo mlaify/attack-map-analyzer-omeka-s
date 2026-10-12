@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Omeka S ACL, admin login and API key auth (#2, mlaify/AttackMap#261)
+
+- **Per-route access on `Route.auth` / `guards` / `guard_evidence`** (core contract AttackMap#256). `$acl->allow()` / `->deny()` rules in `Module.php` and `*AclFactory.php` are parsed (roles, resources resolved through `namespace`/`use`, privileges, assertions) and matched to each route's controller and action: an unconditional allow for `null`/`'guest'` makes it `anonymous`; an anonymous deny or Omeka's default deny makes it `required` (`omeka_acl:requires_role(<role>)` / `omeka_acl:default_deny`); conditional or unresolved rules leave it `unknown`. `__ADMIN__` routes are `required` (`omeka:admin_login`).
+- **API key auth**: `__KEYAUTH__` routes (`/api`) note `key_identity`/`key_credential` in `guard_evidence`, and a `protocol:omeka_api_key` `ProtocolHint` is emitted for them and for code reading the parameters.
+- Omeka S core real world: 40 routes, 27 `anonymous` and 13 `required` (all hand-checked against `AclFactory.php` and `routes.config.php`); 2 API-key protocol hints.
+
+### Changed — structural routes and a cheap `detect()` (#2)
+
+- **Routes are walked structurally** (`phparray.py`/`routes.py`, copied from `attackmap-analyzer-php-laminas` pending AttackMap#259): `child_routes` joined, `may_terminate`, Method verbs, Segment optional parts expanded, Regex `spec`. A module's `'admin' => ['child_routes' => …]` stub joins Omeka core's `/admin` (`/admin/harvester`, not `/harvester[/:action]` and `[/:id]`). Omeka S core: 20 → 40 routes, none fragments.
+- **`detect()` reads no PHP files.** It checks `application/Module.php`, `config/module.ini` and `modules/*/config/module.ini` by existence, then `composer.json` (`omeka/omeka-s` name or dependency, `omeka-s-module` type). It used to read every non-vendored PHP file looking for `namespace Omeka`. A plain Laminas app (`module/` + `config/application.config.php`) is no longer detected as Omeka S (laminas-mvc-skeleton: was detected, now isn't).
+- Non-auth hints were already moved to typed lists (AttackMap#258, below); `auth_hints` stays empty.
+
 ### Fixed — false positives on ordinary PHP (port of mlaify/attackmap-analyzer-php-web#2)
 
 - **Route names are not routes.** `'route' =>` values must be URL path specs: rooted (`/harvester[/:action]`) or an optional child segment (`[/:id]`). Omeka module admin navigation (`'navigation' => ['AdminModule' => [['route' => 'admin/harvester']]]`) no longer yields `ANY admin/harvester` routes. This is the Laminas form of php-web's config `'path' =>` fix.

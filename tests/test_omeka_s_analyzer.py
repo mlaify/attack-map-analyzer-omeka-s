@@ -127,8 +127,10 @@ def test_detect_does_not_follow_symlink_out_of_repo(tmp_path: Path) -> None:
     outside.mkdir()
     (outside / "Module.php").write_text("<?php\nnamespace Omeka;\n")
     repo = tmp_path / "repo"
-    repo.mkdir()
+    (repo / "application").mkdir(parents=True)
     (repo / "Module.php").symlink_to(outside / "Module.php")
+    # The `application/Module.php` marker must not resolve outside the repo.
+    (repo / "application" / "Module.php").symlink_to(outside / "Module.php")
     assert OmekaSAnalyzer().detect(repo) is False
 
 
@@ -152,8 +154,10 @@ NOISE = FIXTURES / "omeka_module_noise"
 def test_navigation_route_names_are_not_routes() -> None:
     # Omeka admin navigation `'route' => 'admin/harvester'` names a route;
     # only the router's path specs are routes.
+    # The module's `'admin' => ['child_routes' => ...]` stub joins Omeka
+    # core's `/admin`, and the `[/:id]` child joins `/harvester` (#2).
     result = OmekaSAnalyzer().analyze(NOISE)
-    assert {(r.path, r.method) for r in result.routes} == {("/harvester[/:action]", "ANY"), ("[/:id]", "ANY")}
+    assert {(r.path, r.method) for r in result.routes} == {("/admin/harvester", "ANY"), ("/admin/harvester/:id", "ANY")}
 
 
 def test_db_and_api_connection_settings_are_not_secrets() -> None:

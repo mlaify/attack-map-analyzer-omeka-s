@@ -1,7 +1,16 @@
 from __future__ import annotations
 
 from attackmap.sdk.contracts import AnalyzerMetadata, AnalyzerProtocol
-from attackmap.sdk.models import AuthHint, DatabaseHint, ExternalCall, FrameworkHint, Route, ScanResult, SecretHint
+from attackmap.sdk.models import (
+    AuthHint,
+    DatabaseHint,
+    ExternalCall,
+    FrameworkHint,
+    ProtocolHint,
+    Route,
+    ScanResult,
+    SecretHint,
+)
 
 # Compatibility alias used by existing analyzer implementations.
 AttackMapAnalyzerProtocol = AnalyzerProtocol
@@ -14,6 +23,7 @@ __all__ = [
     "DatabaseHint",
     "AuthHint",
     "FrameworkHint",
+    "ProtocolHint",
     "SecretHint",
     "ScanResult",
 ]

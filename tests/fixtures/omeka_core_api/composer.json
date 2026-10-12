@@ -1,0 +1,5 @@
+{
+  "name": "omeka/omeka-s",
+  "type": "project",
+  "require": { "laminas/laminas-mvc": "^3.3" }
+}
