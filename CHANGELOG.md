@@ -46,6 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **License metadata uses an SPDX expression (PEP 639).** `license = "MIT"` and `license-files = ["LICENSE"]` replace the deprecated `license = {text = "MIT"}` table, and the `License ::` classifier (which setuptools ≥ 77 rejects next to an expression) is gone. The build backend floor is now `setuptools>=77` (mlaify/AttackMap#259).
+- **Import the analyzer contract from `attackmap.sdk` directly; `contracts.py` is gone.** It only re-exported SDK types (and aliased `AnalyzerProtocol` as `AttackMapAnalyzerProtocol`), and its four copy-pasted variants drifted across the plugins (mlaify/AttackMap#259).
 - **Priority 20 → 160** (AttackMap#221). Core now runs analyzers in `(priority, name)` order and merges first-seen-wins, so this application-specific analyzer runs after the generic `php-web` (40) and `php-laminas` (70) analyzers. Still experimental and opt-in: `attackmap analyze <repo> -m omeka-s`.
 - Skip list is now the SDK's `DEFAULT_SKIP_DIRS` (was `vendor`, `.git`, `node_modules`; adds `build`, `dist`, `out`, `target`, virtualenvs and caches).
 - Files are visited in sorted, depth-first order, so signal order is deterministic across filesystems. The set of signals is unchanged.

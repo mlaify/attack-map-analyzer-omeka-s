@@ -4,19 +4,23 @@ import json
 import re
 from pathlib import Path
 
-from attackmap.sdk import iter_repo_files, line_of, line_snippet, read_source, rel
-
-from .acl import Acl, AclRule, Decision, acl_rules, combine
-from .contracts import (
+from attackmap.sdk import (
     AnalyzerMetadata,
     DatabaseHint,
     ExternalCall,
     FrameworkHint,
+    iter_repo_files,
+    line_of,
+    line_snippet,
     ProtocolHint,
+    read_source,
+    rel,
     Route,
     ScanResult,
     SecretHint,
 )
+
+from .acl import Acl, AclRule, Decision, acl_rules, combine
 from .phparray import (
     NameContext,
     TokenList,
